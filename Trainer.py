@@ -1,7 +1,6 @@
 import os
-import json
-from typing import Dict, List, Callable
 import torch
+from typing import Dict, List, Callable
 import TrainAShape
 import VisualizeAShape
 
@@ -18,10 +17,10 @@ class DeepSDFTrainer:
     # Train multiple models/scenes
     # ------------------------
     def train_models(
-        self,
-        model_scenes: Dict[str, List[Callable]],
-        starting_ids: Dict[str, int] = None,
-        resume: bool = True
+    self,
+    model_scenes: Dict[str, List[Callable]],
+    starting_ids: Dict[str, int] = None,
+    resume: bool = True
     ):
         """
         Train multiple models, each with multiple scenes.
@@ -29,28 +28,34 @@ class DeepSDFTrainer:
         Args:
             model_scenes: Dict of model names -> list of SDF functions (one per scene)
             starting_ids: Dict of starting scene_id per model (default 0)
-            resume: If True, continue training from latest checkpoints (per model)
+            resume: If True, continue training from latest checkpoints
         """
         if starting_ids is None:
             starting_ids = {name: 0 for name in model_scenes}
 
         for model_name, sdfs in model_scenes.items():
             start_id = starting_ids.get(model_name, 0)
+            scene_ids = [start_id + idx for idx in range(len(sdfs))]
             print(f"[INFO] Training model '{model_name}' with {len(sdfs)} scenes…")
 
-            for idx, sdf_func in enumerate(sdfs):
-                scene_id = start_id + idx
-                print(f"  -> Processing scene {scene_id:03d} for model {model_name}")
-
-                # trainAShape handles:
-                # - skipping sample generation if it already exists
-                # - resuming training / latent management
+            # Train each scene individually, preserving previous latents
+            for scene_id, sdf_func in zip(scene_ids, sdfs):
+                print(f"  -> Training scene {scene_id:03d} for model '{model_name}'")
                 TrainAShape.trainAShape(
                     model_name=model_name,
                     sdf_function=sdf_func,
-                    scene_id=scene_id,
+                    scene_ids=[scene_id],
                     resume=resume
                 )
+
+    @staticmethod
+    def _batch_sdf(queries, sdfs, scene_ids):
+        """
+        Return SDF values for a batch of queries across multiple scenes.
+        Only supports one scene at a time for now, picks first scene.
+        """
+        # This is compatible with trainAShape which expects queries -> sdf
+        return sdfs[0](queries)
 
     # ------------------------
     # Visualize a model (single or all scenes)
@@ -68,14 +73,12 @@ class DeepSDFTrainer:
         """
         print(f"[INFO] Visualizing model '{model_name}' …")
 
-        root = os.path.join(self.base_dir, model_name)
-        latent_file = os.path.join(root, "LatentCodes", "latest.pth")
-
+        latent_file = os.path.join(self.base_dir, model_name, "LatentCodes", "latest.pth")
         if not os.path.exists(latent_file):
             raise FileNotFoundError(f"No latent file found for {model_name} at {latent_file}")
 
         all_latents = torch.load(latent_file, map_location="cpu").get("latent_codes", {})
-        # Keep only scene keys ending with digits
+        # Filter scene keys ending with digits
         latents = {k: v for k, v in all_latents.items() if k.split("_")[-1].isdigit()}
 
         if not latents:
@@ -93,7 +96,6 @@ class DeepSDFTrainer:
                 mesh = VisualizeAShape.visualize_a_shape(model_name, scene_id=scene_id)
                 meshes.append(mesh)
         else:
-            # Visualize only the first scene
             first_key = next(iter(latents))
             scene_id = int(first_key.split("_")[-1])
             print(f"  -> Visualizing first scene {scene_id:03d}")
