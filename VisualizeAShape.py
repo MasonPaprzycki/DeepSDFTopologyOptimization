@@ -6,27 +6,16 @@ import trimesh
 from skimage import measure
 from DeepSDFStruct.deep_sdf.networks.deep_sdf_decoder import DeepSDFDecoder as Decoder
 
-import os
-import json
-import torch
-import numpy as np
-import trimesh
-from skimage import measure
-
-# Make sure Decoder is imported from your DeepSDF code
-from DeepSDFStruct.deep_sdf.networks.deep_sdf_decoder import DeepSDFDecoder as Decoder
-
-
 def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     """
-    Visualize a specific shape from a trained DeepSDF model with multiple shapes per model folder.
-    Safely handles volumes that may not cross zero.
+    Visualize a specific shape from a trained DeepSDF model and save the mesh
+    under trained_models/<model_name>/Meshes/.
 
     Args:
         model_name (str): Name of the model folder (e.g., "Sphere").
         scene_id (int or str): Scene index (zero-padded internally).
         grid_res (int): Resolution of the 3D grid.
-        clamp_dist (float): Maximum SDF value for clamping to ensure marching cubes works.
+        clamp_dist (float): Maximum SDF value for clamping.
 
     Returns:
         trimesh.Trimesh: The reconstructed mesh.
@@ -47,15 +36,14 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     # Load latent vector
     # ------------------------
     latents = torch.load(latentCheckpoint, map_location="cpu")["latent_codes"]
-
     if scene_key not in latents:
-        raise KeyError(f"Scene key '{scene_key}' not found in latent codes for {model_name}.")
+        raise KeyError(f"Scene key '{scene_key}' not found in latent codes.")
 
     latent_entry = latents[scene_key]
     if isinstance(latent_entry, dict):
         latentVector = latent_entry.get("latent_code")
         if latentVector is None:
-            raise RuntimeError(f"latent dict does not contain 'latent_code': {latent_entry.keys()}")
+            raise RuntimeError(f"latent dict does not contain 'latent_code'.")
     elif isinstance(latent_entry, torch.Tensor):
         latentVector = latent_entry
     else:
@@ -110,40 +98,32 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     sdf = torch.cat(sdf_vals).numpy()
     volume = sdf.reshape(grid_res, grid_res, grid_res)
 
-
-
-    # After computing volume (volume = sdf.reshape(...))
-
+    # ------------------------
+    # Determine marching cubes level
+    # ------------------------
     min_val, max_val = volume.min(), volume.max()
     if min_val == max_val:
-        # completely flat volume, fallback to tiny negative–positive range
-        print(f"Warning: volume is flat (min=max={min_val}). Creating tiny perturbation.")
         volume = np.clip(volume, min_val - 1e-5, min_val + 1e-5)
         level = min_val
     elif min_val > 0:
-        # all values positive → shape is "empty", use min_val for marching cubes
-        print(f"Warning: volume entirely positive (min={min_val:.4f}, max={max_val:.4f}). Using level={min_val:.4f}")
         level = min_val
     elif max_val < 0:
-        # all values negative → shape is "full", use max_val for marching cubes
-        print(f"Warning: volume entirely negative (min={min_val:.4f}, max={max_val:.4f}). Using level={max_val:.4f}")
         level = max_val
     else:
-        # zero is inside range → use level=0
         level = 0.0
 
     verts, faces, normals, _ = measure.marching_cubes(volume, level=level)
-
-    # ------------------------
-    # Marching cubes
-    # ------------------------
     scale = (x[1] - x[0])
     verts = verts * scale + np.array([x[0], y[0], z[0]])
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
 
-    # Save mesh
-    meshFileName = f"{scene_key}_mesh.ply"
+    # ------------------------
+    # Save mesh under model folder
+    # ------------------------
+    mesh_dir = os.path.join(root, "Meshes")
+    os.makedirs(mesh_dir, exist_ok=True)
+    meshFileName = os.path.join(mesh_dir, f"{scene_key}_mesh.ply")
     mesh.export(meshFileName)
-    print(f"Saved mesh to {meshFileName}")
+    print(f"[INFO] Saved mesh to {meshFileName}")
 
     return mesh

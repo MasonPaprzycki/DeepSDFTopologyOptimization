@@ -149,6 +149,12 @@ def trainAShape(model_name, sdf_function, scene_id, resume=True, domainRadius=1.
 
     # ------------------------ Train DeepSDF ------------------------
     checkpoint_file = os.path.join(model_params_dir, "latest.pth")
+
+    # Skip training if checkpoint exists AND scene is in TrainSplit.json
+    if os.path.exists(checkpoint_file) and scene_key in split_dict[split_name][model_name]:
+        print(f"[INFO] Scene {scene_key} already trained, skipping training.")
+        return  # <-- early exit
+
     continue_from = checkpoint_file if resume and os.path.exists(checkpoint_file) else None
     if continue_from:
         print(f"[INFO] Resuming training from {continue_from}")
@@ -160,5 +166,6 @@ def trainAShape(model_name, sdf_function, scene_id, resume=True, domainRadius=1.
         data_source=root,
         continue_from=continue_from
     )
+
 
     print(f"[INFO] Training complete for scene {scene_key}")
