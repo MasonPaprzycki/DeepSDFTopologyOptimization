@@ -63,7 +63,7 @@ def trainAShape(model_name, sdf_function, scene_id, resume=True, domainRadius=1.
         "Description": f"Train DeepSDF on multiple analytic {model_name} shapes.",
         "NetworkArch": "deep_sdf_decoder",
         "DataSource": root,
-        "TrainSplit": "splits/TrainSplit.json",
+        "TrainSplit": "split/TrainSplit.json",   # ✅ fixed
         "ReconstructionSplit": "",
         "NetworkSpecs": {
             "dims": [128, 128, 128, 128, 128, 128],
@@ -97,6 +97,7 @@ def trainAShape(model_name, sdf_function, scene_id, resume=True, domainRadius=1.
         safe_save_json(specs_path, specs)
         print("[INFO] Wrote specs.json to", specs_path)
 
+
     # ------------------------ TrainSplit.json ------------------------
     split_path = os.path.join(split_dir, "TrainSplit.json")
     if os.path.exists(split_path):
@@ -104,14 +105,21 @@ def trainAShape(model_name, sdf_function, scene_id, resume=True, domainRadius=1.
             split_dict = json.load(f)
     else:
         split_dict = {}
-    split_dict.setdefault(model_name, {}).setdefault(split_name, [])
-    # Ensure TrainSplit.json exists on disk
+
+    # Must nest by split -> model_name
+    split_dict.setdefault(split_name, {}).setdefault(model_name, [])
+
     safe_save_json(split_path, split_dict)
 
 
+
+
+
+
     # ------------------------ Generate SDF samples ------------------------
-    samples_path = os.path.join(samples_dir, model_name, split_name, f"{scene_key}.npz")
+    samples_path = os.path.join(samples_dir, split_name, model_name, f"{scene_key}.npz")
     os.makedirs(os.path.dirname(samples_path), exist_ok=True)
+
 
     if os.path.exists(samples_path) and scene_key in split_dict[model_name][split_name]:
         print(f"[INFO] Skipping sample generation for {scene_key} (already exists).")
@@ -130,9 +138,11 @@ def trainAShape(model_name, sdf_function, scene_id, resume=True, domainRadius=1.
         safe_save_npz(samples_path, pos=pos, neg=neg)
 
         # Update TrainSplit.json
-        split_dict[model_name][split_name].append(scene_key)
+        if scene_key not in split_dict[split_name][model_name]:
+            split_dict[split_name][model_name].append(scene_key)
+
         safe_save_json(split_path, split_dict)
-        print(f"[INFO] SDF samples saved and TrainSplit.json updated.")
+
 
     # ------------------------ Train DeepSDF ------------------------
     checkpoint_file = os.path.join(model_params_dir, "latest.pth")
@@ -150,3 +160,4 @@ def trainAShape(model_name, sdf_function, scene_id, resume=True, domainRadius=1.
     )
 
     print(f"[INFO] Training complete for scene {scene_key}")
+    
