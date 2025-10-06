@@ -22,12 +22,17 @@ torch.set_num_interop_threads(min(4, NUM_CORES // 2))
 # ------------------------
 def patch_get_instance_filenames():
     def get_instance_filenames(data_source, split):
+        """
+        Return npz files based only on the split dict.
+        `data_source` is unused here but kept for API compatibility.
+        """
         npyfiles = []
         for split_name, classes in split.items():
             for class_name, instances in classes.items():
                 for instance_name in instances:
                     npyfiles.append(f"{instance_name}.npz")
         return npyfiles
+
     deep_data.get_instance_filenames = get_instance_filenames
 
 patch_get_instance_filenames()
@@ -87,7 +92,6 @@ def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1
             "SnapshotFrequency": 100,
             "AdditionalSnapshots": [1, 5],
             "LearningRateSchedule": [
-                {"Type": "Step", "Initial": 0.0005, "Interval": 250, "Factor": 0.5},
                 {"Type": "Step", "Initial": 0.001, "Interval": 250, "Factor": 0.5}
             ],
             "SamplesPerScene": 2048,
@@ -123,8 +127,9 @@ def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1
             sdf_values = sdf_function(queries).squeeze(1)
             all_samples = torch.cat([queries, sdf_values.unsqueeze(1)], dim=1).numpy()
             clamp_dist = 0.1
-            pos = all_samples[np.abs(all_samples[:, 3]) < clamp_dist]
-            neg = all_samples[np.abs(all_samples[:, 3]) >= clamp_dist]
+            sdf_idx = 3 + len(sdf_parameters)
+            pos = all_samples[np.abs(all_samples[:, sdf_idx]) < clamp_dist]
+            neg = all_samples[np.abs(all_samples[:, sdf_idx]) >= clamp_dist]
             safe_save_npz(samples_path, pos=pos, neg=neg)
             split_dict[split_name][model_name].append(scene_key)
         else:
@@ -141,14 +146,22 @@ def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1
 
     # Train DeepSDF
     print(f"[INFO] Training model '{model_name}' with {len(scene_ids)} scenes…")
+    continue_from = None
+    if resume:
+        ckpt = os.path.join(model_params_dir, "latest.pth")
+        if os.path.exists(ckpt):
+            continue_from = ckpt
+
     training.train_deep_sdf(
         experiment_directory=root,
         data_source=root,
-        continue_from=None,
+        continue_from=continue_from,
         batch_split=1
     )
+
     # -------------------- Merge old latents with new ones --------------------
     new_latents = torch.load(latest_latent_file, map_location="cpu").get("latent_codes", {})
-    merged_latents = {**existing_latents, **new_latents}
+    merged_latents = {**new_latents, **existing_latents}
+
     torch.save({"latent_codes": merged_latents}, latest_latent_file)
     print(f"[INFO] Training complete. Latent codes updated in {latest_latent_file}")
