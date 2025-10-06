@@ -3,6 +3,7 @@ import json
 import tempfile
 import shutil
 import torch
+import glob, re
 import numpy as np
 import DeepSDFStruct.deep_sdf.training as training
 import DeepSDFStruct.deep_sdf.data as deep_data
@@ -11,6 +12,7 @@ import DeepSDFStruct.deep_sdf.networks.deep_sdf_decoder as Decoder
 # ------------------------
 # Limit CPU threads globally
 # ------------------------
+
 NUM_CORES = 16
 os.environ["OMP_NUM_THREADS"] = str(NUM_CORES)
 os.environ["MKL_NUM_THREADS"] = str(NUM_CORES)
@@ -55,7 +57,10 @@ def safe_save_json(path, data):
 # ------------------------
 # Train a single analytic shape (preserve all latents)
 # ------------------------
-def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1.0, sdf_parameters=[]):
+def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1.0, sdf_parameters=None):
+    if sdf_parameters is None:
+        sdf_parameters = []
+
     root = os.path.join("trained_models", model_name)
     split_name = "train"
     
@@ -92,7 +97,8 @@ def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1
             "SnapshotFrequency": 100,
             "AdditionalSnapshots": [1, 5],
             "LearningRateSchedule": [
-                {"Type": "Step", "Initial": 0.001, "Interval": 250, "Factor": 0.5}
+                { "Type": "Step", "Initial": 0.001, "Interval": 250, "Factor": 0.5 },  # for network weights
+                { "Type": "Constant", "Value": 0.001 }                               # for latent codes
             ],
             "SamplesPerScene": 2048,
             "ScenesPerBatch": 1,
@@ -124,34 +130,89 @@ def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1
             queries[:, :3] = (torch.rand(n_points, 3) * 2 - 1) * domainRadius
             for i, (low, high) in enumerate(sdf_parameters):
                 queries[:, 3 + i] = torch.rand(n_points) * (high - low) + low
+
             sdf_values = sdf_function(queries).squeeze(1)
             all_samples = torch.cat([queries, sdf_values.unsqueeze(1)], dim=1).numpy()
             clamp_dist = 0.1
             sdf_idx = 3 + len(sdf_parameters)
+
             pos = all_samples[np.abs(all_samples[:, sdf_idx]) < clamp_dist]
             neg = all_samples[np.abs(all_samples[:, sdf_idx]) >= clamp_dist]
+
+            # ---------------- Balanced subsampling ----------------
+            samples_per_scene = 2048  # match your specs.json
+            n_pos = min(len(pos), samples_per_scene // 2)
+            n_neg = samples_per_scene - n_pos
+
+            if len(pos) > 0:
+                pos = pos[np.random.choice(len(pos), n_pos, replace=False)]
+            if len(neg) > 0:
+                neg = neg[np.random.choice(len(neg), n_neg, replace=False)]
+
             safe_save_npz(samples_path, pos=pos, neg=neg)
             split_dict[split_name][model_name].append(scene_key)
         else:
             print(f"[INFO] Skipping sample generation for {scene_key}")
 
+
     safe_save_json(split_path, split_dict)
 
-    # -------------------- Preserve old latent codes --------------------
-    latest_latent_file = os.path.join(latent_dir, "latest.pth")
-    if os.path.exists(latest_latent_file):
-        existing_latents = torch.load(latest_latent_file, map_location="cpu").get("latent_codes", {})
+    # -------------------- Helpers for checkpoint / latent discovery --------------------
+
+
+    def pick_latest_file_by_mtime(paths):
+        existing = [p for p in paths if os.path.exists(p)]
+        if not existing:
+            return None
+        return max(existing, key=os.path.getmtime)
+
+    def pick_best_resume_ckpt(model_params_dir):
+        """
+        Prefer ModelParameters/latest.pth if present.
+        Otherwise pick the highest-numbered snapshot_*.pth (if present).
+        Otherwise return None.
+        """
+        latest_pth = os.path.join(model_params_dir, "latest.pth")
+        if os.path.exists(latest_pth):
+            return latest_pth
+
+        # Find snapshot_*.pth and pick the largest index
+        pattern = os.path.join(model_params_dir, "snapshot_*.pth")
+        snaps = glob.glob(pattern)
+        if not snaps:
+            return None
+
+        # extract numbers robustly; fallback to mtime if no numbers found
+        max_idx = -1
+        best_snap = None
+        for s in snaps:
+            m = re.search(r"snapshot_(\d+)\.pth$", s)
+            if m:
+                idx = int(m.group(1))
+                if idx > max_idx:
+                    max_idx = idx
+                    best_snap = s
+        if best_snap:
+            return best_snap
+        # fallback to newest by mtime
+        return pick_latest_file_by_mtime(snaps)
+
+    # -------------------- Preserve old latent codes (canonical: LatentCodes/latest.pth) --------------------
+    canonical_latent_file = os.path.join(latent_dir, "latest.pth")
+    if os.path.exists(canonical_latent_file):
+        try:
+            existing_latents = torch.load(canonical_latent_file, map_location="cpu").get("latent_codes", {})
+        except Exception:
+            existing_latents = {}
     else:
         existing_latents = {}
 
-    # Train DeepSDF
-    print(f"[INFO] Training model '{model_name}' with {len(scene_ids)} scenes…")
+    # -------------------- Decide resume checkpoint (prefer ModelParameters) --------------------
     continue_from = None
     if resume:
-        ckpt = os.path.join(model_params_dir, "latest.pth")
-        if os.path.exists(ckpt):
-            continue_from = ckpt
+        continue_from = pick_best_resume_ckpt(model_params_dir)
 
+    print(f"[INFO] Training model '{model_name}' with {len(scene_ids)} scenes (resume={resume}, continue_from={continue_from})...")
     training.train_deep_sdf(
         experiment_directory=root,
         data_source=root,
@@ -159,9 +220,38 @@ def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1
         batch_split=1
     )
 
-    # -------------------- Merge old latents with new ones --------------------
-    new_latents = torch.load(latest_latent_file, map_location="cpu").get("latent_codes", {})
-    merged_latents = {**new_latents, **existing_latents}
+    # -------------------- After training: locate new latents (search LatentCodes then ModelParameters) --------------------
+    candidate_latent_paths = [
+        os.path.join(latent_dir, "latest.pth"),
+        os.path.join(model_params_dir, "latest.pth")
+    ]
+    latest_latent_file_after = pick_latest_file_by_mtime(candidate_latent_paths)
 
-    torch.save({"latent_codes": merged_latents}, latest_latent_file)
-    print(f"[INFO] Training complete. Latent codes updated in {latest_latent_file}")
+    if latest_latent_file_after and os.path.exists(latest_latent_file_after):
+        try:
+            new_latents = torch.load(latest_latent_file_after, map_location="cpu").get("latent_codes", {})
+        except Exception:
+            new_latents = {}
+    else:
+        new_latents = {}
+
+    # Merge logic: keep existing latents unless training produced a new one for the same key.
+    # So new overrides existing for retrained keys, existing preserved otherwise.
+    merged_latents = {**existing_latents, **new_latents}
+
+    # Save merged latents atomically to LatentCodes/latest.pth (canonical)
+    final_latent_path = canonical_latent_file
+    tmp_path = final_latent_path + ".tmp"
+    try:
+        torch.save({"latent_codes": merged_latents}, tmp_path)
+        os.replace(tmp_path, final_latent_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    # Optional logging: how many were added/overwritten
+    added = set(new_latents.keys()) - set(existing_latents.keys())
+    overwritten = set(new_latents.keys()) & set(existing_latents.keys())
+    print(f"[INFO] Training complete. Latent codes updated in {final_latent_path}")
+    print(f"[INFO] {len(added)} new latent keys added, {len(overwritten)} keys overwritten.")
+
