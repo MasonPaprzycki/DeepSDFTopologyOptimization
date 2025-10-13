@@ -6,19 +6,31 @@ import trimesh
 from skimage import measure
 from DeepSDFStruct.deep_sdf.networks.deep_sdf_decoder import DeepSDFDecoder as Decoder
 
-def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
+
+def visualize_a_shape(
+    model_name,
+    scene_id=0,
+    grid_res=128,
+    clamp_dist=0.1,
+    operator_value=None,
+    latent_override=None,
+    save_suffix=None,
+):
     """
-    Visualize a specific shape from a trained DeepSDF model and save the mesh
-    under trained_models/<model_name>/Meshes/.
+    Visualize a shape from a trained DeepSDF model.
+    Can also visualize interpolated latent codes or operator-conditioned shapes.
 
     Args:
-        model_name (str): Name of the model folder (e.g., "Sphere").
-        scene_id (int or str): Scene index (zero-padded internally).
-        grid_res (int): Resolution of the 3D grid.
-        clamp_dist (float): Maximum SDF value for clamping.
+        model_name (str): Name of the trained model folder.
+        scene_id (int or str): Scene index to load latent from.
+        grid_res (int): Grid resolution for marching cubes.
+        clamp_dist (float): Max SDF value for clamping.
+        operator_value (float, optional): If provided, used to modify latent conditioning.
+        latent_override (torch.Tensor, optional): Direct latent code to use.
+        save_suffix (str, optional): Extra text appended to mesh filename.
 
     Returns:
-        trimesh.Trimesh: The reconstructed mesh.
+        trimesh.Trimesh: The generated mesh.
     """
 
     # ------------------------
@@ -35,24 +47,40 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     # ------------------------
     # Load latent vector
     # ------------------------
-    latents = torch.load(latentCheckpoint, map_location="cpu")["latent_codes"]
-    if scene_key not in latents:
-        raise KeyError(f"Scene key '{scene_key}' not found in latent codes.")
-
-    latent_entry = latents[scene_key]
-    if isinstance(latent_entry, dict):
-        latentVector = latent_entry.get("latent_code")
-        if latentVector is None:
-            raise RuntimeError(f"latent dict does not contain 'latent_code'.")
-    elif isinstance(latent_entry, torch.Tensor):
-        latentVector = latent_entry
+    if latent_override is not None:
+        latentVector = latent_override.view(1, -1)
     else:
-        raise RuntimeError(f"Unexpected latent type: {type(latent_entry)}")
+        latents = torch.load(latentCheckpoint, map_location="cpu")["latent_codes"]
+        if scene_key not in latents:
+            raise KeyError(f"Scene key '{scene_key}' not found in latent codes.")
 
-    latentVector = latentVector.view(1, -1)
+        latent_entry = latents[scene_key]
+        if isinstance(latent_entry, dict):
+            latentVector = latent_entry.get("latent_code")
+            if latentVector is None:
+                raise RuntimeError("Latent dict missing 'latent_code'.")
+        elif isinstance(latent_entry, torch.Tensor):
+            latentVector = latent_entry
+        else:
+            raise RuntimeError(f"Unexpected latent type: {type(latent_entry)}")
+
+        latentVector = latentVector.view(1, -1)
 
     # ------------------------
-    # Load model specs
+    # Inject operator value (optional)
+    # ------------------------
+    if operator_value is not None:
+        # if latent is 2D: replace second dim with operator_value
+        # if higher-dim: add small modulation on last dim
+        if latentVector.shape[1] >= 2:
+            latentVector = latentVector.clone()
+            latentVector[0, 1] = operator_value
+        else:
+            latentVector = torch.cat([latentVector, torch.tensor([[operator_value]])], dim=1)
+        print(f"[INFO] Injected operator_value={operator_value:.2f} into latent vector.")
+
+    # ------------------------
+    # Load model specs and decoder
     # ------------------------
     with open(modelSpecs) as f:
         specs = json.load(f)
@@ -60,9 +88,6 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     latent_size = specs["CodeLength"]
     hidden_dims = specs["NetworkSpecs"]["dims"]
 
-    # ------------------------
-    # Build decoder
-    # ------------------------
     decoder = Decoder(
         latent_size=latent_size,
         dims=hidden_dims,
@@ -71,7 +96,7 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
         latent_in=tuple(specs["NetworkSpecs"].get("latent_in", ())),
         weight_norm=specs["NetworkSpecs"].get("weight_norm", False),
         xyz_in_all=specs["NetworkSpecs"].get("xyz_in_all", False),
-        use_tanh=specs["NetworkSpecs"].get("use_tanh", False)
+        use_tanh=specs["NetworkSpecs"].get("use_tanh", False),
     )
 
     ckpt = torch.load(decoderCheckpoint, map_location="cpu")
@@ -79,7 +104,7 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     decoder.eval()
 
     # ------------------------
-    # Evaluate SDF on 3D grid
+    # Evaluate SDF field
     # ------------------------
     x = y = z = np.linspace(-1.2, 1.2, grid_res)
     grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), -1)
@@ -89,7 +114,7 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     batch = 50000
     with torch.no_grad():
         for i in range(0, len(pts), batch):
-            chunk = pts[i:i + batch]
+            chunk = pts[i : i + batch]
             latent_repeat = latentVector.repeat(chunk.size(0), 1)
             decoder_input = torch.cat([latent_repeat, chunk], dim=1)
             sdf_chunk = decoder(decoder_input)
@@ -97,14 +122,10 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
 
     sdf = torch.cat(sdf_vals).numpy()
     volume = sdf.reshape(grid_res, grid_res, grid_res)
-
-    # ------------------------
-    # Clamp SDF to avoid large outliers
-    # ------------------------
     volume = np.clip(volume, -clamp_dist, clamp_dist)
 
     # ------------------------
-    # Determine marching cubes level
+    # Extract surface
     # ------------------------
     min_val, max_val = volume.min(), volume.max()
     if min_val == max_val:
@@ -118,18 +139,24 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
         level = 0.0
 
     verts, faces, normals, _ = measure.marching_cubes(volume, level=level)
-    scale = (x[1] - x[0])
+    scale = x[1] - x[0]
     verts = verts * scale + np.array([x[0], y[0], z[0]])
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
 
     # ------------------------
-    # Save mesh under model folder
+    # Save mesh
     # ------------------------
     mesh_dir = os.path.join(root, "Meshes")
     os.makedirs(mesh_dir, exist_ok=True)
-    meshFileName = os.path.join(mesh_dir, f"{scene_key}_mesh.ply")
+
+    suffix = (
+        f"_op{operator_value:.2f}" if operator_value is not None else ""
+    )
+    if save_suffix:
+        suffix += f"_{save_suffix}"
+
+    meshFileName = os.path.join(mesh_dir, f"{scene_key}{suffix}_mesh.ply")
     mesh.export(meshFileName)
-    print(f"[INFO] Saved mesh to {meshFileName}")
+    print(f"[INFO] Saved mesh → {meshFileName}")
 
     return mesh
-
