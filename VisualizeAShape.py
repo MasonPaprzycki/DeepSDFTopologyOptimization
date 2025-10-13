@@ -28,7 +28,7 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     scene_str = f"{scene_id:03d}" if isinstance(scene_id, int) else str(scene_id)
     scene_key = f"{model_name.lower()}_{scene_str}"
 
-    latentCheckpoint = os.path.join(root, "LatentCodes", "latest.pth")
+    latentCheckpoint = os.path.join(root, "LatentCodes", f"{scene_key}.pth")
     decoderCheckpoint = os.path.join(root, "ModelParameters", "latest.pth")
     modelSpecs = os.path.join(root, "specs.json")
 
@@ -99,6 +99,11 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     volume = sdf.reshape(grid_res, grid_res, grid_res)
 
     # ------------------------
+    # Clamp SDF to avoid large outliers
+    # ------------------------
+    volume = np.clip(volume, -clamp_dist, clamp_dist)
+
+    # ------------------------
     # Determine marching cubes level
     # ------------------------
     min_val, max_val = volume.min(), volume.max()
@@ -127,3 +132,4 @@ def visualize_a_shape(model_name, scene_id=0, grid_res=128, clamp_dist=0.1):
     print(f"[INFO] Saved mesh to {meshFileName}")
 
     return mesh
+

@@ -1,23 +1,46 @@
 #!/usr/bin/env bash
-set -e  # stop if anything fails
+set -e  # stop on first error
 
-# Create the virtual environment if it doesn't exist
+echo "🔧 Setting up DeepSDFTopologyOptimization environment..."
+
+# --- Create venv if missing ---
 if [ ! -d ".venv" ]; then
-    echo "Creating virtual environment…"
-    python3 -m venv .venv
+    echo "📦 Creating virtual environment..."
+    python -m venv .venv
+else
+    echo "✅ Virtual environment already exists."
 fi
 
-# Activate the environment
-echo "Activating virtual environment…"
-source .venv/bin/activate
+# --- Activate venv ---
+echo "⚡ Activating virtual environment..."
+# shellcheck disable=SC1091
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+elif [ -f ".venv/Scripts/activate" ]; then
+    # Windows (Git Bash)
+    source .venv/Scripts/activate
+else
+    echo "❌ Could not find activation script."
+    exit 1
+fi
 
-# Upgrade pip and install the dependency
-echo "Installing DeepSDFStruct…"
-pip install --upgrade pip
-pip install --verbose git+https://github.com/mkofler96/DeepSDFStruct.git
+# --- Upgrade pip etc ---
+echo "⬆️ Upgrading pip, setuptools, wheel..."
+pip install --upgrade pip setuptools wheel
 
-echo "All done."
-echo "To use this environment in a new terminal later, run:"
-echo "    source .venv/bin/activate"
+# --- Install dependencies ---
+echo "📦 Installing dependencies..."
+pip install torch numpy trimesh scikit-image mesh-to-sdf git+https://github.com/mkofler96/DeepSDFStruct.git
 
+# --- Verify imports ---
+echo "🔍 Verifying imports..."
+python - <<'PY'
+import torch, numpy, trimesh, mesh_to_sdf
+from skimage import measure
+import DeepSDFStruct
+print("✅ All imports OK")
+PY
 
+echo "✅ Installation complete."
+echo "To activate later, run: source .venv/bin/activate  (or .venv/Scripts/activate on Windows)"
+echo "🎉 Setup finished successfully."
