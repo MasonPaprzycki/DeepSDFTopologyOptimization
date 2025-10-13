@@ -127,8 +127,17 @@ def trainAShape(model_name, sdf_function, scene_ids,
     # Helper utilities
     # --------------------
     def epoch_from_filename(path):
-        m = re.search(r"snapshot_(\d+)\.pth$", os.path.basename(path))
-        return int(m.group(1)) if m else None
+        base = os.path.splitext(os.path.basename(path))[0]
+        # handle 'latest' explicitly as unknown epoch
+        if base == "latest":
+            return None
+        try:
+            # for files named "1.pth", "5.pth", etc.
+            return int(base)
+        except ValueError:
+            # fallback for snapshot-style names
+            m = re.search(r"snapshot_(\d+)$", base)
+            return int(m.group(1)) if m else None
 
     def read_checkpoint_safe(path):
         try:
@@ -160,7 +169,9 @@ def trainAShape(model_name, sdf_function, scene_ids,
         latest = os.path.join(model_params_dir, "latest.pth")
         if os.path.exists(latest):
             cands.append(latest)
-        snaps = glob.glob(os.path.join(model_params_dir, "snapshot_*.pth"))
+
+        # accept both snapshot_###.pth and numeric ###.pth files
+        snaps = glob.glob(os.path.join(model_params_dir, "*.pth"))
         snaps_sorted = sorted(
             snaps,
             key=lambda p: (
@@ -173,18 +184,92 @@ def trainAShape(model_name, sdf_function, scene_ids,
         cands.extend(snaps_sorted)
         return cands
 
+
+
     def find_best_checkpoint_with_scene(scene_key):
+        """
+        Find the best model checkpoint (under ModelParameters/) that can be used
+        to resume training for `scene_key`. We inspect LatentCodes/ for any file
+        that contains the scene_key (either a numeric latent snapshot or a per-scene file).
+        - If a numeric latent file (e.g. LatentCodes/5.pth) contains the scene,
+        prefer the matching ModelParameters/5.pth (if present).
+        - If a per-scene latent file (e.g. LatentCodes/sphere_000.pth) contains it,
+        fall back to the most-recent ModelParameters/*.pth (latest by mtime).
+        Returns (model_params_checkpoint_path, epoch_or_None).
+        """
         best = (None, -1)
-        for ck in list_candidate_checkpoints():
-            data = read_checkpoint_safe(ck)
+
+        # 1) scan latent files to find ones that contain this scene_key
+        latent_files = sorted(
+            glob.glob(os.path.join(latent_dir, "*.pth")),
+            key=lambda p: os.path.getmtime(p),
+        )
+        for latent_fp in latent_files:
+            data = read_checkpoint_safe(latent_fp)
             if not isinstance(data, dict):
                 continue
             latent_codes = data.get("latent_codes", {})
             if scene_key not in latent_codes:
                 continue
-            epoch = checkpoint_epoch_from_dict(data) or epoch_from_filename(ck) or -1
-            if epoch > best[1]:
-                best = (ck, epoch)
+
+            latent_epoch = epoch_from_filename(latent_fp)
+            if latent_epoch is not None:
+                candidate_model = os.path.join(model_params_dir, f"{latent_epoch}.pth")
+                if os.path.exists(candidate_model):
+                    if isinstance(latent_epoch, int) and latent_epoch > (best[1] if isinstance(best[1], int) else -1):
+                        best = (candidate_model, latent_epoch)
+                    continue
+
+                # fallback to latest.pth
+                latest_model = os.path.join(model_params_dir, "latest.pth")
+                if os.path.exists(latest_model):
+                    latest_data = read_checkpoint_safe(latest_model)
+                    latest_epoch = (
+                        checkpoint_epoch_from_dict(latest_data)
+                        or epoch_from_filename(latest_model)
+                        or -1
+                    )
+                    epoch_a = latest_epoch if isinstance(latest_epoch, (int, float)) else -1
+                    epoch_b = best[1] if isinstance(best[1], (int, float)) else -1
+                    if epoch_a > epoch_b:
+                        best = (latest_model, latest_epoch)
+                    continue
+
+            # If latent filename isn't numeric (e.g., "sphere_000.pth"), choose most recent model params
+            global_ckpts = sorted(
+                glob.glob(os.path.join(model_params_dir, "*.pth")),
+                key=lambda p: os.path.getmtime(p),
+            )
+            if global_ckpts:
+                latest_model = global_ckpts[-1]
+                latest_epoch = (
+                    checkpoint_epoch_from_dict(read_checkpoint_safe(latest_model))
+                    or epoch_from_filename(latest_model)
+                    or -1
+                )
+                epoch_a = latest_epoch if isinstance(latest_epoch, (int, float)) else -1
+                epoch_b = best[1] if isinstance(best[1], (int, float)) else -1
+                if epoch_a > epoch_b or best[0] is None:
+                    best = (latest_model, latest_epoch)
+
+        # 2) If we didn’t find any latent file that includes this scene, check the model params themselves
+        if best[0] is None:
+            for ck in list_candidate_checkpoints():
+                data = read_checkpoint_safe(ck)
+                if not isinstance(data, dict):
+                    continue
+                latent_codes = data.get("latent_codes", {})
+                if scene_key in latent_codes:
+                    epoch = (
+                        checkpoint_epoch_from_dict(data)
+                        or epoch_from_filename(ck)
+                        or -1
+                    )
+                    epoch_a = epoch if isinstance(epoch, (int, float)) else -1
+                    epoch_b = best[1] if isinstance(best[1], (int, float)) else -1
+                    if epoch_a > epoch_b:
+                        best = (ck, epoch)
+
         return (best[0], best[1] if best[0] is not None else None)
 
     def is_scene_fully_trained(scene_key):
@@ -193,18 +278,43 @@ def trainAShape(model_name, sdf_function, scene_ids,
         return bool(ckpt and epoch is not None and int(epoch) >= target_epoch)
 
     def save_scene_latent_from_checkpoint(scene_key, ckpt_path, to_path):
-        data = read_checkpoint_safe(ckpt_path)
-        if not isinstance(data, dict):
+        """
+        Given a model checkpoint path (from ModelParameters), find the appropriate
+        latent file that contains the scene_key and save out a per-scene latent.
+        Works both when latent file is numeric (LatentCodes/5.pth) or per-scene (LatentCodes/sphere_000.pth).
+        """
+        if ckpt_path is None:
             return False
-        latent_codes = data.get("latent_codes", {})
-        if scene_key not in latent_codes:
-            return False
-        latent = latent_codes[scene_key]
-        if isinstance(latent, torch.Tensor):
-            latent = latent.detach().cpu()
-        torch.save({"latent_codes": {scene_key: latent}}, to_path)
-        return True
 
+        # First try to extract epoch from ckpt_path and use LatentCodes/<epoch>.pth
+        epoch = epoch_from_filename(ckpt_path)
+        if epoch is not None:
+            latent_path = os.path.join(latent_dir, f"{epoch}.pth")
+            if os.path.exists(latent_path):
+                data = read_checkpoint_safe(latent_path)
+                if isinstance(data, dict):
+                    latent_codes = data.get("latent_codes", {})
+                    if scene_key in latent_codes:
+                        latent = latent_codes[scene_key]
+                        if isinstance(latent, torch.Tensor):
+                            latent = latent.detach().cpu()
+                        torch.save({"latent_codes": {scene_key: latent}}, to_path)
+                        return True
+
+        # If that didn't work, scan all latent files to find one containing scene_key
+        for latent_fp in sorted(glob.glob(os.path.join(latent_dir, "*.pth")), key=lambda p: os.path.getmtime(p), reverse=True):
+            data = read_checkpoint_safe(latent_fp)
+            if not isinstance(data, dict):
+                continue
+            latent_codes = data.get("latent_codes", {})
+            if scene_key in latent_codes:
+                latent = latent_codes[scene_key]
+                if isinstance(latent, torch.Tensor):
+                    latent = latent.detach().cpu()
+                torch.save({"latent_codes": {scene_key: latent}}, to_path)
+                return True
+
+        return False
     # --------------------
     # Per-scene training loop
     # --------------------
@@ -284,7 +394,20 @@ def trainAShape(model_name, sdf_function, scene_ids,
         if resume:
             ckpt_with_scene, epoch_with_scene = find_best_checkpoint_with_scene(scene_key)
             if ckpt_with_scene:
-                continue_from = ckpt_with_scene[:-4] if ckpt_with_scene.endswith(".pth") else ckpt_with_scene
+                continue_from = ckpt_with_scene[:-4]
+                print(f"[INFO] Resuming {scene_key} from epoch {epoch_with_scene} ({ckpt_with_scene})")
+            else:
+                # fallback: latest global checkpoint
+                global_ckpts = sorted(
+                    glob.glob(os.path.join(model_params_dir, "*.pth")),
+                    key=lambda p: os.path.getmtime(p),
+                )
+                if global_ckpts:
+                    latest_global = global_ckpts[-1]
+                    continue_from = latest_global[:-4]
+                    print(f"[INFO] No scene-specific checkpoint found; resuming from global latest {latest_global}")
+                else:
+                    print(f"[INFO] No checkpoints found at all for {scene_key}; starting fresh.")
 
         print(f"[INFO] Training scene {scene_key} … (resume_from: {continue_from})")
         training.train_deep_sdf(
