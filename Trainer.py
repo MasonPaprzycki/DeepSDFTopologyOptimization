@@ -4,6 +4,7 @@ from typing import Dict, List, Callable
 import TrainAShape
 import VisualizeAShape
 
+
 class DeepSDFTrainer:
     """
     Wrapper to train and visualize multiple DeepSDF models with multiple scenes.
@@ -17,10 +18,10 @@ class DeepSDFTrainer:
     # Train multiple models/scenes
     # ------------------------
     def train_models(
-    self,
-    model_scenes: Dict[str, List[Callable]],
-    starting_ids: Dict[str, int] = None,
-    resume: bool = True
+        self,
+        model_scenes: Dict[str, List[Callable]],
+        starting_ids: Dict[str, int] = None,
+        resume: bool = True,
     ):
         """
         Train multiple models, each with multiple scenes.
@@ -38,23 +39,21 @@ class DeepSDFTrainer:
             scene_ids = [start_id + idx for idx in range(len(sdfs))]
             print(f"[INFO] Training model '{model_name}' with {len(sdfs)} scenes…")
 
-            # Train each scene individually, preserving previous latents
             for scene_id, sdf_func in zip(scene_ids, sdfs):
                 print(f"  -> Training scene {scene_id:03d} for model '{model_name}'")
                 TrainAShape.trainAShape(
                     model_name=model_name,
                     sdf_function=sdf_func,
                     scene_ids=[scene_id],
-                    resume=resume
+                    resume=resume,
                 )
 
     @staticmethod
     def _batch_sdf(queries, sdfs, scene_ids):
         """
         Return SDF values for a batch of queries across multiple scenes.
-        Only supports one scene at a time for now, picks first scene.
+        Only supports one scene at a time for now (picks first scene).
         """
-        # This is compatible with trainAShape which expects queries -> sdf
         return sdfs[0](queries)
 
     # ------------------------
@@ -73,34 +72,37 @@ class DeepSDFTrainer:
         """
         print(f"[INFO] Visualizing model '{model_name}' …")
 
-        latent_file = os.path.join(self.base_dir, model_name, "LatentCodes", "latest.pth")
-        if not os.path.exists(latent_file):
-            raise FileNotFoundError(f"No latent file found for {model_name} at {latent_file}")
-
-        all_latents = torch.load(latent_file, map_location="cpu").get("latent_codes", {})
-        # Filter scene keys ending with digits
-        latents = {k: v for k, v in all_latents.items() if k.split("_")[-1].isdigit()}
-
-        if not latents:
-            raise RuntimeError(
-                f"No valid scene latents found for model '{model_name}'. "
-                f"Found keys: {list(all_latents.keys())}"
+        latent_dir = os.path.join(self.base_dir, model_name, "LatentCodes")
+        if not os.path.exists(latent_dir):
+            raise FileNotFoundError(
+                f"[ERROR] LatentCodes directory missing for {model_name} at {latent_dir}"
             )
+
+        # List all per-scene latent files (e.g., mymodel_000.pth)
+        latent_files = sorted(
+            f
+            for f in os.listdir(latent_dir)
+            if f.endswith(".pth") and "_" in f and f.split("_")[-1].split(".")[0].isdigit()
+        )
+
+        if not latent_files:
+            raise RuntimeError(f"No per-scene latent files found for model '{model_name}'.")
 
         meshes = []
 
         if all_scenes:
-            for scene_key in sorted(latents.keys()):
-                scene_id = int(scene_key.split("_")[-1])
+            for latent_file in latent_files:
+                scene_id = int(latent_file.split("_")[-1].split(".")[0])
                 print(f"  -> Visualizing scene {scene_id:03d}")
                 mesh = VisualizeAShape.visualize_a_shape(model_name, scene_id=scene_id)
                 meshes.append(mesh)
         else:
-            first_key = next(iter(latents))
-            scene_id = int(first_key.split("_")[-1])
+            # Visualize only the first scene latent
+            first_latent = latent_files[0]
+            scene_id = int(first_latent.split("_")[-1].split(".")[0])
             print(f"  -> Visualizing first scene {scene_id:03d}")
             mesh = VisualizeAShape.visualize_a_shape(model_name, scene_id=scene_id)
             meshes.append(mesh)
 
-        print(f"[INFO] Done visualizing model '{model_name}'")
+        print(f"[INFO] Done visualizing model '{model_name}'.")
         return meshes
