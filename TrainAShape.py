@@ -389,18 +389,25 @@ def trainAShape(model_name, sdf_function, scene_ids,
                 except Exception:
                     pass
 
+       
+        # ------------------------------
         # Resume checkpoint logic
+        # ------------------------------
         continue_from = None
+        latest_ckpt = os.path.join(model_params_dir, "latest.pth")
+        latest_latent = os.path.join(latent_dir, "latest.pth")
+
         if resume:
+            # 1️⃣ Find the best checkpoint for this scene
             ckpt_with_scene, epoch_with_scene = find_best_checkpoint_with_scene(scene_key)
             if ckpt_with_scene:
                 continue_from = ckpt_with_scene[:-4]
                 print(f"[INFO] Resuming {scene_key} from epoch {epoch_with_scene} ({ckpt_with_scene})")
             else:
-                # fallback: latest global checkpoint
+                # 2️⃣ Fallback: latest global checkpoint
                 global_ckpts = sorted(
                     glob.glob(os.path.join(model_params_dir, "*.pth")),
-                    key=lambda p: os.path.getmtime(p),
+                    key=os.path.getmtime,
                 )
                 if global_ckpts:
                     latest_global = global_ckpts[-1]
@@ -409,6 +416,35 @@ def trainAShape(model_name, sdf_function, scene_ids,
                 else:
                     print(f"[INFO] No checkpoints found at all for {scene_key}; starting fresh.")
 
+        # ------------------------------
+        # Ensure ModelParameters/latest.pth
+        # ------------------------------
+        if continue_from:
+            src_ckpt = f"{continue_from}.pth"
+            if os.path.exists(src_ckpt):
+                shutil.copy(src_ckpt, latest_ckpt)
+                print(f"[INFO] Copied {src_ckpt} → latest.pth for DeepSDF resume")
+
+        # ------------------------------
+        # Ensure LatentCodes/latest.pth
+        # ------------------------------
+        if continue_from:
+            # Use numeric latent file matching continue_from if available
+            src_latent = os.path.join(latent_dir, os.path.basename(continue_from) + ".pth")
+            if os.path.exists(src_latent):
+                shutil.copy(src_latent, latest_latent)
+                print(f"[INFO] Copied {src_latent} → LatentCodes/latest.pth")
+            else:
+                # Fallback: pick most recent latent containing this scene
+                latent_ckpts = sorted(glob.glob(os.path.join(latent_dir, "*.pth")), key=os.path.getmtime, reverse=True)
+                for lc in latent_ckpts:
+                    data = read_checkpoint_safe(lc)
+                    if isinstance(data, dict) and "latent_codes" in data and scene_key in data["latent_codes"]:
+                        shutil.copy(lc, latest_latent)
+                        print(f"[INFO] Copied {lc} → LatentCodes/latest.pth (fallback)")
+                        break
+
+        # --- Train ---
         print(f"[INFO] Training scene {scene_key} … (resume_from: {continue_from})")
         training.train_deep_sdf(
             experiment_directory=root,
@@ -416,6 +452,7 @@ def trainAShape(model_name, sdf_function, scene_ids,
             continue_from=continue_from,
             batch_split=1,
         )
+
 
         # After training, ensure final checkpoint and latent extraction
         candidate_ckpt, candidate_epoch = find_best_checkpoint_with_scene(scene_key)
