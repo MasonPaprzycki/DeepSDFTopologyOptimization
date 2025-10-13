@@ -54,9 +54,18 @@ def safe_save_json(path, data):
         json.dump(data, f, indent=2)
 
 # ------------------------
-# Train a single analytic shape (preserve all latents)
+# Train a model on a shape
+# Takes in a function of any form that can be queried for SDF values
+# Must be watertight and defined within a unit sphere
+# Defualt function of (x,y,z) in [-1,1]^3 -> sdf
+# Additional SDF parameters can be provided as a list of (min, max) tuples
+# Trains a model consecutively on each scene_id without disturbing previous latents
 # ------------------------
-def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1.0, sdf_parameters=None):
+def trainAShape(
+        model_name, sdf_function, scene_ids, 
+        resume=True, domainRadius=1.0, sdf_parameters=None,
+        latentDim=1
+        ):
     
     if sdf_parameters is None:
         sdf_parameters = []
@@ -91,7 +100,7 @@ def trainAShape(model_name, sdf_function, scene_ids, resume=True, domainRadius=1
                 "weight_norm": True,
                 "geom_dimension": 3 + len(sdf_parameters)
             },
-            "CodeLength": 1,
+            "CodeLength": latentDim,
             "NumEpochs": 500,
             "SnapshotFrequency": 100,
             "AdditionalSnapshots": [1, 5],

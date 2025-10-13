@@ -1,3 +1,5 @@
+#bash script that should set up a venv and install all dependencies on windows
+
 #!/usr/bin/env bash
 set -e  # stop on first error
 
