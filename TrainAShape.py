@@ -1,11 +1,12 @@
 import os
 import json
 import torch
-import glob, re
 import numpy as np
-import shutil
 import DeepSDFStruct.deep_sdf.data as deep_data
 import DeepSDFStruct.deep_sdf.training as training
+import DeepSDFStruct.deep_sdf.workspace 
+
+
 # ------------------------
 # Limit CPU threads globally
 # ------------------------
@@ -15,7 +16,6 @@ os.environ["OMP_NUM_THREADS"] = str(NUM_CORES)
 os.environ["MKL_NUM_THREADS"] = str(NUM_CORES)
 torch.set_num_threads(NUM_CORES)
 torch.set_num_interop_threads(min(4, NUM_CORES // 2))
-
 
 # ------------------------
 # Patch DeepSDF loader for flat SdfSamples
@@ -44,21 +44,25 @@ def trainAShape(
     sdf_parameters=None,
     latentDim=1,
     FORCE_ONLY_FINAL_SNAPSHOT=False
-    ):
-    
+):
+ 
+
     if sdf_parameters is None:
         sdf_parameters = []
 
     # ---------------- Folder setup ----------------
-    root = os.path.join("trained_models", model_name)
+    root = os.path.abspath(os.path.join("trained_models", model_name))  # absolute path
     split_dir = os.path.join(root, "split")
     model_params_dir = os.path.join(root, "ModelParameters")
     scenes_dir = os.path.join(root, "Scenes")
     samples_dir = os.path.join(root, "SdfSamples")
-    top_latent_dir = os.path.join(root, "LatentCodes")  # DeepSDF top-level
+    top_latent_dir = os.path.join(root, "LatentCodes")
 
     for d in [root, split_dir, model_params_dir, scenes_dir, samples_dir, top_latent_dir]:
         os.makedirs(d, exist_ok=True)
+
+    print(f"[DEBUG] Using experiment directory: {root}")
+    print(f"[DEBUG] Latent code directory: {top_latent_dir}")
 
     # ---------------- Specs ----------------
     specs_path = os.path.join(root, "specs.json")
@@ -85,11 +89,11 @@ def trainAShape(
             },
             "CodeLength": latentDim,
             "NumEpochs": 500,
-            "SnapshotFrequency": 100,
+            "SnapshotFrequency": 1,
             "AdditionalSnapshots": [1, 5],
             "LearningRateSchedule": [
-                {"Type": "Step", "Initial":0.001, "Interval":250, "Factor":0.5},
-                {"Type": "Constant", "Value":0.001}
+                {"Type": "Step", "Initial": 0.001, "Interval": 250, "Factor": 0.5},
+                {"Type": "Constant", "Value": 0.001}
             ],
             "SamplesPerScene": 5000,
             "ScenesPerBatch": 1,
@@ -101,8 +105,8 @@ def trainAShape(
         }
 
     if FORCE_ONLY_FINAL_SNAPSHOT:
-        specs["SnapshotFrequency"] = specs.get("NumEpochs", specs["SnapshotFrequency"])
-        specs["AdditionalSnapshots"] = [specs.get("NumEpochs")]
+        specs["SnapshotFrequency"] = specs["NumEpochs"]
+        specs["AdditionalSnapshots"] = [specs["NumEpochs"]]
 
     with open(specs_path, "w") as f:
         json.dump(specs, f, indent=2)
@@ -129,16 +133,27 @@ def trainAShape(
         scene_latent_dir = os.path.join(scene_folder, "LatentCodes")
         os.makedirs(scene_latent_dir, exist_ok=True)
 
-        # ---------------- Skip if per-scene latest.pth exists ----------------
-        scene_latest_file = os.path.join(scene_latent_dir, "latest.pth")
-        if resume and os.path.exists(scene_latest_file):
-            scene_data = torch.load(scene_latest_file, map_location="cpu")
-            epochs_done = scene_data.get("epochs", {}).get(scene_key, 0)
-            if epochs_done >= specs["NumEpochs"]:
-                print(f"[INFO] Scene {scene_key} already fully trained, skipping...")
-                continue
+        # ---------------- Resume logic: find highest checkpoint ----------------
+        existing_ckpts = [
+            f for f in os.listdir(top_latent_dir)
+            if f.endswith(".pth") and f[:-4].isdigit()
+        ]
+        latest_epoch = max([int(f[:-4]) for f in existing_ckpts], default=0)
+
+        if resume and latest_epoch >= specs["NumEpochs"]:
+            print(f"[INFO] Scene {scene_key} already fully trained (epoch {latest_epoch}), skipping...")
+            continue
+
+        resume_ckpt = None
+        if resume and latest_epoch > 0:
+            resume_ckpt = str(latest_epoch)
+            print(f"[INFO] Resuming {model_name} at epoch {latest_epoch}")
+
+            latent_path = os.path.join(top_latent_dir, f"{resume_ckpt}.pth")
+            print(f"[DEBUG] Expecting latent file at: {os.path.abspath(latent_path)}")
+            print(f"[DEBUG] Exists: {os.path.exists(latent_path)}")
         else:
-            epochs_done = 0
+            print(f"[INFO] Starting fresh training for {model_name}")
 
         # ---------------- SDF Samples ----------------
         samples_file = os.path.join(samples_dir, f"{scene_key}.npz")
@@ -162,26 +177,39 @@ def trainAShape(
             np.savez_compressed(samples_file, pos=pos, neg=neg)
 
         # ---------------- Train ----------------
-        training.train_deep_sdf(
-            experiment_directory=root,
-            data_source=root,  # expects SdfSamples/ here
-            continue_from=None if epochs_done == 0 else "latest",
-            batch_split=1
-        )
+        old_cwd = os.getcwd()
+        os.chdir(root)  # <-- Force working directory to experiment folder
+        try:
+            print(f"[DEBUG] Changed directory to: {os.getcwd()}")
+            training.train_deep_sdf(
+                experiment_directory=root,
+                data_source=root,
+                continue_from=resume_ckpt,
+                batch_split=1
+            )
+        finally:
+            os.chdir(old_cwd)
+            print(f"[DEBUG] Restored directory to: {os.getcwd()}")
 
-        # ---------------- Reload trained latent from top-level ----------------
-        top_latest_file = os.path.join(top_latent_dir, "latest.pth")
-        top_data = torch.load(top_latest_file, map_location="cpu")
+        # ---------------- Find latest (highest) checkpoint after training ----------------
+        post_ckpts = [
+            f for f in os.listdir(top_latent_dir)
+            if f.endswith(".pth") and f[:-4].isdigit()
+        ]
+        if not post_ckpts:
+            raise RuntimeError(f"No checkpoints found in {top_latent_dir} after training.")
+        final_epoch = max(int(f[:-4]) for f in post_ckpts)
+
+        # ---------------- Extract trained latent ----------------
+        final_ckpt_file = os.path.join(top_latent_dir, f"{final_epoch}.pth")
+        top_data = torch.load(final_ckpt_file, map_location="cpu")
         latent_trained = top_data["latent_codes"][scene_key]
 
         # ---------------- Save per-scene snapshots ----------------
-        snapshots = specs["AdditionalSnapshots"] + [specs["NumEpochs"]]
-        for snap in snapshots:
-            snap_file = os.path.join(scene_latent_dir, f"{snap}.pth")
-            torch.save({"latent_codes": {scene_key: latent_trained}, "epochs": {scene_key: snap}}, snap_file)
+        final_scene_file = os.path.join(scene_latent_dir, f"{final_epoch}.pth")
+        torch.save(
+            {"latent_codes": {scene_key: latent_trained}, "epochs": {scene_key: final_epoch}},
+            final_scene_file
+        )
 
-        # ---------------- Write per-scene latest.pth after training ----------------
-        torch.save({"latent_codes": {scene_key: latent_trained}, "epochs": {scene_key: specs["NumEpochs"]}},
-                   scene_latest_file)
-
-        print(f"[INFO] Finished training scene {scene_key}")
+        print(f"[INFO] Finished training scene {scene_key} (final epoch {final_epoch})")

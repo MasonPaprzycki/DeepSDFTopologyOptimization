@@ -118,4 +118,3 @@ class DeepSDFTrainer:
 
         print(f"[INFO] Done visualizing model '{model_name}'.")
         return meshes
-
