@@ -5,9 +5,29 @@ import TrainAShape
 import VisualizeAShape
 
 
+import os
+import torch
+from typing import Dict, List, Callable
+
+import os
+import torch
+from typing import Dict, List, Callable
+
 class DeepSDFTrainer:
     """
     Wrapper to train and visualize multiple DeepSDF models with multiple scenes.
+    Each scene now has its own folder:
+        trained_models/
+            model_name/
+                ModelParameters/
+                Scenes/
+                    000/
+                        LatentCodes/
+                            1.pth, 5.pth, latest.pth
+                        model_000.npz
+                    001/
+                        LatentCodes/
+                            ...
     """
 
     def __init__(self, base_dir="trained_models"):
@@ -41,6 +61,7 @@ class DeepSDFTrainer:
 
             for scene_id, sdf_func in zip(scene_ids, sdfs):
                 print(f"  -> Training scene {scene_id:03d} for model '{model_name}'")
+                # Call trainAShape with the new folder structure
                 TrainAShape.trainAShape(
                     model_name=model_name,
                     sdf_function=sdf_func,
@@ -61,48 +82,40 @@ class DeepSDFTrainer:
     # ------------------------
     def visualize_model(self, model_name: str, all_scenes: bool = False):
         """
-        Visualize one or all latents (scenes) of a model.
+        Visualize one or all scenes for a given model using the scene-located latest.pth latents.
 
         Args:
             model_name (str): Name of the model folder.
             all_scenes (bool): If True, visualize all scenes. If False, only the first.
 
         Returns:
-            List[trimesh.Trimesh]: Generated meshes
+            List[trimesh.Trimesh]: Generated meshes.
         """
         print(f"[INFO] Visualizing model '{model_name}' …")
 
-        latent_dir = os.path.join(self.base_dir, model_name, "LatentCodes")
-        if not os.path.exists(latent_dir):
-            raise FileNotFoundError(
-                f"[ERROR] LatentCodes directory missing for {model_name} at {latent_dir}"
-            )
+        scenes_root = os.path.join(self.base_dir, model_name, "Scenes")
+        if not os.path.exists(scenes_root):
+            raise FileNotFoundError(f"[ERROR] Scenes folder missing for {model_name} at {scenes_root}")
 
-        # List all per-scene latent files (e.g., mymodel_000.pth)
-        latent_files = sorted(
-            f
-            for f in os.listdir(latent_dir)
-            if f.endswith(".pth") and "_" in f and f.split("_")[-1].split(".")[0].isdigit()
-        )
-
-        if not latent_files:
-            raise RuntimeError(f"No per-scene latent files found for model '{model_name}'.")
+        scene_folders = sorted([f for f in os.listdir(scenes_root) if f.isdigit()])
+        if not scene_folders:
+            raise RuntimeError(f"No scene folders found in {scenes_root}")
 
         meshes = []
 
         if all_scenes:
-            for latent_file in latent_files:
-                scene_id = int(latent_file.split("_")[-1].split(".")[0])
+            for scene_folder in scene_folders:
+                scene_id = int(scene_folder)
                 print(f"  -> Visualizing scene {scene_id:03d}")
                 mesh = VisualizeAShape.visualize_a_shape(model_name, scene_id=scene_id)
                 meshes.append(mesh)
         else:
-            # Visualize only the first scene latent
-            first_latent = latent_files[0]
-            scene_id = int(first_latent.split("_")[-1].split(".")[0])
+            # Visualize only the first scene
+            scene_id = int(scene_folders[0])
             print(f"  -> Visualizing first scene {scene_id:03d}")
             mesh = VisualizeAShape.visualize_a_shape(model_name, scene_id=scene_id)
             meshes.append(mesh)
 
         print(f"[INFO] Done visualizing model '{model_name}'.")
         return meshes
+

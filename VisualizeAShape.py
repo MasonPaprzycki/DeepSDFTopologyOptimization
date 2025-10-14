@@ -16,81 +16,46 @@ def visualize_a_shape(
     latent_override=None,
     save_suffix=None,
 ):
-    """
-    Visualize a shape from a trained DeepSDF model.
-    Can also visualize interpolated latent codes or operator-conditioned shapes.
-
-    Args:
-        model_name (str): Name of the trained model folder.
-        scene_id (int or str): Scene index to load latent from.
-        grid_res (int): Grid resolution for marching cubes.
-        clamp_dist (float): Max SDF value for clamping.
-        operator_value (float, optional): If provided, used to modify latent conditioning.
-        latent_override (torch.Tensor, optional): Direct latent code to use.
-        save_suffix (str, optional): Extra text appended to mesh filename.
-
-    Returns:
-        trimesh.Trimesh: The generated mesh.
-    """
-
-    # ------------------------
-    # Paths
-    # ------------------------
+    # ---------------- Paths ----------------
     root = os.path.join("trained_models", model_name)
     scene_str = f"{scene_id:03d}" if isinstance(scene_id, int) else str(scene_id)
     scene_key = f"{model_name.lower()}_{scene_str}"
 
-    latentCheckpoint = os.path.join(root, "LatentCodes", f"{scene_key}.pth")
+    scene_dir = os.path.join(root, "Scenes", scene_str)
+    latent_dir = os.path.join(scene_dir, "LatentCodes")
     decoderCheckpoint = os.path.join(root, "ModelParameters", "latest.pth")
-    modelSpecs = os.path.join(root, "specs.json")
+    specs_file = os.path.join(root, "specs.json")
+    scene_latest_latent = os.path.join(latent_dir, "latest.pth")
 
-    # ------------------------
-    # Load latent vector
-    # ------------------------
+    # ---------------- Load latent ----------------
     if latent_override is not None:
         latentVector = latent_override.view(1, -1)
     else:
-        latents = torch.load(latentCheckpoint, map_location="cpu")["latent_codes"]
+        if os.path.exists(scene_latest_latent):
+            latents = torch.load(scene_latest_latent, map_location="cpu")["latent_codes"]
+        else:
+            raise FileNotFoundError(f"No latest.pth found for scene {scene_key}")
+
         if scene_key not in latents:
             raise KeyError(f"Scene key '{scene_key}' not found in latent codes.")
+        latentVector = latents[scene_key].view(1, -1)
 
-        latent_entry = latents[scene_key]
-        if isinstance(latent_entry, dict):
-            latentVector = latent_entry.get("latent_code")
-            if latentVector is None:
-                raise RuntimeError("Latent dict missing 'latent_code'.")
-        elif isinstance(latent_entry, torch.Tensor):
-            latentVector = latent_entry
-        else:
-            raise RuntimeError(f"Unexpected latent type: {type(latent_entry)}")
-
-        latentVector = latentVector.view(1, -1)
-
-    # ------------------------
-    # Inject operator value (optional)
-    # ------------------------
+    # ---------------- Optional operator injection ----------------
     if operator_value is not None:
-        # if latent is 2D: replace second dim with operator_value
-        # if higher-dim: add small modulation on last dim
+        latentVector = latentVector.clone()
         if latentVector.shape[1] >= 2:
-            latentVector = latentVector.clone()
             latentVector[0, 1] = operator_value
         else:
             latentVector = torch.cat([latentVector, torch.tensor([[operator_value]])], dim=1)
         print(f"[INFO] Injected operator_value={operator_value:.2f} into latent vector.")
 
-    # ------------------------
-    # Load model specs and decoder
-    # ------------------------
-    with open(modelSpecs) as f:
+    # ---------------- Load decoder ----------------
+    with open(specs_file) as f:
         specs = json.load(f)
 
-    latent_size = specs["CodeLength"]
-    hidden_dims = specs["NetworkSpecs"]["dims"]
-
     decoder = Decoder(
-        latent_size=latent_size,
-        dims=hidden_dims,
+        latent_size=specs["CodeLength"],
+        dims=specs["NetworkSpecs"]["dims"],
         geom_dimension=3,
         norm_layers=tuple(specs["NetworkSpecs"].get("norm_layers", ())),
         latent_in=tuple(specs["NetworkSpecs"].get("latent_in", ())),
@@ -103,9 +68,7 @@ def visualize_a_shape(
     decoder.load_state_dict(ckpt["model_state_dict"])
     decoder.eval()
 
-    # ------------------------
-    # Evaluate SDF field
-    # ------------------------
+    # ---------------- Evaluate SDF ----------------
     x = y = z = np.linspace(-1.2, 1.2, grid_res)
     grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), -1)
     pts = torch.from_numpy(grid.reshape(-1, 3)).float()
@@ -114,19 +77,17 @@ def visualize_a_shape(
     batch = 50000
     with torch.no_grad():
         for i in range(0, len(pts), batch):
-            chunk = pts[i : i + batch]
+            chunk = pts[i:i+batch]
             latent_repeat = latentVector.repeat(chunk.size(0), 1)
             decoder_input = torch.cat([latent_repeat, chunk], dim=1)
             sdf_chunk = decoder(decoder_input)
             sdf_vals.append(sdf_chunk.squeeze(1).cpu())
 
     sdf = torch.cat(sdf_vals).numpy()
-    volume = sdf.reshape(grid_res, grid_res, grid_res)
-    volume = np.clip(volume, -clamp_dist, clamp_dist)
+    volume = np.clip(sdf.reshape(grid_res, grid_res, grid_res), -clamp_dist, clamp_dist)
 
-    # ------------------------
-    # Extract surface
-    # ------------------------
+    # ---------------- Surface extraction ----------------
+    level = 0.0
     min_val, max_val = volume.min(), volume.max()
     if min_val == max_val:
         volume = np.clip(volume, min_val - 1e-5, min_val + 1e-5)
@@ -135,23 +96,17 @@ def visualize_a_shape(
         level = min_val
     elif max_val < 0:
         level = max_val
-    else:
-        level = 0.0
 
     verts, faces, normals, _ = measure.marching_cubes(volume, level=level)
     scale = x[1] - x[0]
     verts = verts * scale + np.array([x[0], y[0], z[0]])
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
 
-    # ------------------------
-    # Save mesh
-    # ------------------------
-    mesh_dir = os.path.join(root, "Meshes")
+    # ---------------- Save mesh ----------------
+    mesh_dir = os.path.join(scene_dir, "Meshes")
     os.makedirs(mesh_dir, exist_ok=True)
 
-    suffix = (
-        f"_op{operator_value:.2f}" if operator_value is not None else ""
-    )
+    suffix = f"_op{operator_value:.2f}" if operator_value is not None else ""
     if save_suffix:
         suffix += f"_{save_suffix}"
 

@@ -6,6 +6,7 @@ import DeepSDFStruct.sdf_primitives as sdf_primitives
 # ---------------------------
 # Experiment to confirm correlations between latent vectors and linear shape parameters
 # ---------------------------
+
 if __name__ == "__main__":
     trainer = Trainer.DeepSDFTrainer()
 
@@ -31,8 +32,10 @@ if __name__ == "__main__":
     scene_params["Cylinder"] = [{"point": [0,0,0], "axis": "y", "radius": r} for r in radii]
 
     # Torus
-    model_scenes["Torus"] = [sdf_primitives.TorusSDF(center=[0,0,0], R=R, r=r)._compute for R in radii for r in torus_radii]
-    scene_params["Torus"] = [{"center": [0,0,0], "R": R, "r": r} for R in radii for r in torus_radii]
+    model_scenes["Torus"] = [sdf_primitives.TorusSDF(center=[0,0,0], R=R, r=r)._compute 
+                              for R in radii for r in torus_radii]
+    scene_params["Torus"] = [{"center": [0,0,0], "R": R, "r": r} 
+                              for R in radii for r in torus_radii]
 
     # ---------------------------
     # Train all models/scenes
@@ -52,17 +55,19 @@ if __name__ == "__main__":
     print("\nLatent vectors with parameters for all models and scenes:")
     for model_name in model_scenes.keys():
         latent_dir = os.path.join(trainer.base_dir, model_name, "LatentCodes")
-        if not os.path.exists(latent_dir):
-            print(f"No latent folder found for model {model_name}")
+        latest_latent_file = os.path.join(latent_dir, "latest.pth")
+
+        if not os.path.exists(latest_latent_file):
+            print(f"No latest.pth found for model {model_name}")
             continue
 
-        for idx, fname in enumerate(sorted(os.listdir(latent_dir))):
-            if fname.endswith(".pth"):
-                latent_path = os.path.join(latent_dir, fname)
-                latent_dict = torch.load(latent_path, map_location="cpu")
-                scene_key = list(latent_dict["latent_codes"].keys())[0]
-                latent_code = latent_dict["latent_codes"][scene_key]
+        latest_data = torch.load(latest_latent_file, map_location="cpu")
+        all_latents = latest_data.get("latent_codes", {})
 
-                # Get associated parameters
-                params = scene_params[model_name][idx]
-                print(f"Model: {model_name}, Scene: {scene_key}, Parameters: {params}, Latent vector: {latent_code.numpy().flatten()}")
+        for scene_key in sorted(all_latents.keys()):
+            latent_code = all_latents[scene_key]
+            # Extract scene index from key
+            idx = int(scene_key.split("_")[-1])
+            params = scene_params[model_name][idx]
+            print(f"Model: {model_name}, Scene: {scene_key}, Parameters: {params}, "
+                  f"Latent vector: {latent_code.numpy().flatten()}")
