@@ -4,7 +4,6 @@ import torch
 import numpy as np
 import DeepSDFStruct.deep_sdf.data as deep_data
 import DeepSDFStruct.deep_sdf.training as training
-import DeepSDFStruct.deep_sdf.workspace 
 
 
 # ------------------------
@@ -178,15 +177,35 @@ def trainAShape(
 
         # ---------------- Train ----------------
         old_cwd = os.getcwd()
-        os.chdir(root)  # <-- Force working directory to experiment folder
+        os.chdir(root)
         try:
             print(f"[DEBUG] Changed directory to: {os.getcwd()}")
+
+            logs_file = os.path.join(root, "Logs.pth")
+
+            # --- NEW: create a minimal log file if missing ---
+            if not os.path.exists(logs_file):
+                print(f"[WARN] Logs.pth not found — creating a blank log so training can resume.")
+                torch.save(
+                    {
+                        "loss": [],
+                        "learning_rate": [],
+                        "timing": [],
+                        "latent_magnitude": [],
+                        "param_magnitude": [],
+                        "epoch": [],
+                    },
+                    logs_file,
+                )
+
+            # --- Run training (resume if resume_ckpt is valid) ---
             training.train_deep_sdf(
                 experiment_directory=root,
                 data_source=root,
                 continue_from=resume_ckpt,
                 batch_split=1
             )
+
         finally:
             os.chdir(old_cwd)
             print(f"[DEBUG] Restored directory to: {os.getcwd()}")
