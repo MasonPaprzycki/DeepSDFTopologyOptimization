@@ -4,7 +4,6 @@ import torch
 import numpy as np
 import DeepSDFStruct.deep_sdf.data as deep_data
 import DeepSDFStruct.deep_sdf.training as training
-import DeepSDFStruct.deep_sdf.workspace 
 
 
 # ------------------------

@@ -32,7 +32,7 @@ pip install --upgrade pip setuptools wheel
 
 # --- Install dependencies ---
 echo "📦 Installing dependencies..."
-pip install torch numpy trimesh scikit-image mesh-to-sdf
+pip install torch numpy trimesh scikit-image mesh-to-sdf https://github.com/MasonPaprzycki/DeepSDFStruct
 
 # --- Verify imports ---
 echo "🔍 Verifying imports..."
