@@ -5,6 +5,9 @@ import numpy as np
 import DeepSDFStruct.deep_sdf.data as deep_data
 import DeepSDFStruct.deep_sdf.training as training
 
+# ------------------------
+# logs are dummy files and do not contain any logs
+# ------------------------
 
 # ------------------------
 # Limit CPU threads globally
