@@ -1,17 +1,7 @@
 import os
-import torch
-from typing import Dict, List, Callable
+from typing import Dict, List, Callable, Optional
 import TrainAShape
 import VisualizeAShape
-
-
-import os
-import torch
-from typing import Dict, List, Callable
-
-import os
-import torch
-from typing import Dict, List, Callable
 
 class DeepSDFTrainer:
     """
@@ -30,7 +20,7 @@ class DeepSDFTrainer:
                             ...
     """
 
-    def __init__(self, base_dir="trained_models"):
+    def __init__(self, base_dir: str = "trained_models"):
         self.base_dir = base_dir
         os.makedirs(self.base_dir, exist_ok=True)
 
@@ -40,16 +30,24 @@ class DeepSDFTrainer:
     def train_models(
         self,
         model_scenes: Dict[str, List[Callable]],
-        starting_ids: Dict[str, int] = None,
+        starting_ids: Optional[Dict[str, int]] = None,
         resume: bool = True,
+        sdf_parameters: Optional[List] = None,
+        latentDim: int = 1,
+        FORCE_ONLY_FINAL_SNAPSHOT: bool = False,
+        domainRadius: float = 1.0,
     ):
         """
         Train multiple models, each with multiple scenes.
 
         Args:
-            model_scenes: Dict of model names -> list of SDF functions (one per scene)
-            starting_ids: Dict of starting scene_id per model (default 0)
-            resume: If True, continue training from latest checkpoints
+            model_scenes (Dict[str, List[Callable]]): Dict of model names -> list of SDF functions (one per scene)
+            starting_ids (Dict[str, int], optional): Starting scene_id per model (default 0)
+            resume (bool): If True, continue training from latest checkpoints
+            sdf_parameters (List[Tuple[float, float]], optional): List of (low, high) parameter ranges for SDF conditioning
+            latentDim (int): Latent vector dimension
+            FORCE_ONLY_FINAL_SNAPSHOT (bool): If True, only save the last snapshot
+            domainRadius (float): Sampling domain radius
         """
         if starting_ids is None:
             starting_ids = {name: 0 for name in model_scenes}
@@ -57,16 +55,21 @@ class DeepSDFTrainer:
         for model_name, sdfs in model_scenes.items():
             start_id = starting_ids.get(model_name, 0)
             scene_ids = [start_id + idx for idx in range(len(sdfs))]
+
             print(f"[INFO] Training model '{model_name}' with {len(sdfs)} scenes…")
 
             for scene_id, sdf_func in zip(scene_ids, sdfs):
                 print(f"  -> Training scene {scene_id:03d} for model '{model_name}'")
-                # Call trainAShape with the new folder structure
+
                 TrainAShape.trainAShape(
                     model_name=model_name,
                     sdf_function=sdf_func,
                     scene_ids=[scene_id],
+                    sdf_parameters=sdf_parameters,   
+                    latentDim=latentDim,
                     resume=resume,
+                    FORCE_ONLY_FINAL_SNAPSHOT=FORCE_ONLY_FINAL_SNAPSHOT,
+                    domainRadius=domainRadius,
                 )
 
     @staticmethod
