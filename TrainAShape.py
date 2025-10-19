@@ -45,6 +45,7 @@ patch_get_instance_filenames()
 # minor modifications however. 
 # ------------------------
 def trainAShape(
+    base_directory: str,
     model_name,
     sdf_function,
     scene_ids,
@@ -54,18 +55,38 @@ def trainAShape(
     latentDim=1,
     FORCE_ONLY_FINAL_SNAPSHOT=False
 ):
- 
-
     if sdf_parameters is None:
         sdf_parameters = []
+    param_names = []
+    param_ranges = {}
+    if isinstance(sdf_parameters, dict):
+        param_names = list(sdf_parameters.keys())
+        param_ranges = dict(sdf_parameters)  # preserve original before flattening
+
+        valid = {}
+        for k, v in param_ranges.items():
+            # only accept real numeric (low, high)
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                lo, hi = v
+                if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and hi > lo:
+                    valid[k] = (lo, hi)
+            # otherwise ignore silently
+
+        # overwrite param_ranges with only valid entries
+        param_ranges = valid
+
+        # flatten
+        sdf_parameters = list(param_ranges.values())
+
+
 
     # ---------------- Folder setup ----------------
-    root = os.path.abspath(os.path.join("trained_models", model_name))  # absolute path
-    split_dir = os.path.join(root, "split")
-    model_params_dir = os.path.join(root, "ModelParameters")
-    scenes_dir = os.path.join(root, "Scenes")
-    samples_dir = os.path.join(root, "SdfSamples")
-    top_latent_dir = os.path.join(root, "LatentCodes")
+    root = os.path.abspath(os.path.join(base_directory, model_name))  # absolute path
+    split_dir = os.path.abspath(os.path.join(root, "split"))
+    model_params_dir = os.path.abspath(os.path.join(root, "ModelParameters"))
+    scenes_dir = os.path.abspath(os.path.join(root, "Scenes"))
+    samples_dir = os.path.abspath(os.path.join(root, "SdfSamples"))
+    top_latent_dir = os.path.abspath(os.path.join(root, "LatentCodes"))
 
     for d in [root, split_dir, model_params_dir, scenes_dir, samples_dir, top_latent_dir]:
         os.makedirs(d, exist_ok=True)
@@ -110,7 +131,9 @@ def trainAShape(
             "ClampingDistance": 0.1,
             "CodeRegularization": True,
             "CodeRegularizationLambda": 1e-4,
-            "CodeBound": 1.0
+            "CodeBound": 1.0,
+            "ParamNames": param_names,
+            "ParamRanges": param_ranges
         }
 
     if FORCE_ONLY_FINAL_SNAPSHOT:
@@ -172,11 +195,27 @@ def trainAShape(
         if not os.path.exists(samples_file):
             n_points = 50_000
             queries = torch.empty(n_points, 3 + len(sdf_parameters))
+
+            # sample xyz in bounding cube
             queries[:, :3] = (torch.rand(n_points, 3) * 2 - 1) * domainRadius
-            for i, (low, high) in enumerate(sdf_parameters):
-                queries[:, 3 + i] = torch.rand(n_points) * (high - low) + low
+            # sample parameters in specified ranges (only if present)
+            if sdf_parameters and len(sdf_parameters) > 0:
+                # ensure they are all valid (tuples of length 2)
+                valid_ranges = []
+                for p in sdf_parameters:
+                    if isinstance(p, (list, tuple)) and len(p) == 2:
+                        valid_ranges.append(p)
+                    else:
+                        raise ValueError(f"Invalid param range {p}, expected (low, high).")
+                lows  = torch.tensor([lo for lo, hi in valid_ranges], dtype=torch.float32)
+                highs = torch.tensor([hi for lo, hi in valid_ranges], dtype=torch.float32)
+                param_rand = torch.rand(n_points, len(valid_ranges))
+                queries[:, 3:] = lows + param_rand * (highs - lows)
+
+            # evaluate sdf
             sdf_vals = sdf_function(queries).squeeze(1)
             data = torch.cat([queries, sdf_vals.unsqueeze(1)], dim=1).numpy()
+
             idx = 3 + len(sdf_parameters)
             pos = data[np.abs(data[:, idx]) < specs["ClampingDistance"]]
             neg = data[np.abs(data[:, idx]) >= specs["ClampingDistance"]]

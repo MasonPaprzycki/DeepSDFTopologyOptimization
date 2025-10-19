@@ -1,0 +1,5 @@
+[INFO] Training model 'Sphere' with 19 scenes…
+  -> Training scene 000 for model 'Sphere'
+[DEBUG] Using experiment directory: C:\GitHub\DeepSDFTopologyOptimization\experiments\OneLinParamW1dDiscreteInterpolation\trained_models\Sphere
+[DEBUG] Latent code directory: C:\GitHub\DeepSDFTopologyOptimization\experiments\OneLinParamW1dDiscreteInterpolation\trained_models\Sphere\LatentCodes
+[INFO] Starting fresh training for Sphere

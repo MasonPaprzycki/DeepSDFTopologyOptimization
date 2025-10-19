@@ -54,7 +54,7 @@ if __name__ == "__main__":
     # Define training shapes
     # ---------------------------
     # Radii for shape variation
-    radii = [0.1, 0.3, 0.5, 0.7, 0.9]
+    radii = [0.1, 0.3, 0.5, 0.7, 0.9] 
     torus_ratio = 0.5  # small radius = R * ratio
     operator_codes = {"Sphere": 0, "CornerSphere": 1, "Cylinder": 2, "Torus": 3}
 
@@ -65,23 +65,27 @@ if __name__ == "__main__":
     # Sphere
     for r in radii:
         model_scenes.append(sdf_primitives.SphereSDF(center=[0, 0, 0], radius=r)._compute)
-        sdf_parameters.append({"R": r, "operator": operator_codes["Sphere"]})
+        sdf_parameters.append({"R": float(r), "operator": float(operator_codes["Sphere"])})
 
     # CornerSphere
     for r in radii:
         model_scenes.append(sdf_primitives.CornerSpheresSDF(radius=r)._compute)
-        sdf_parameters.append({"R": r, "operator": operator_codes["CornerSphere"]})
+        sdf_parameters.append({"R": float(r), "operator": float(operator_codes["CornerSphere"])})
 
     # Cylinder
     for r in radii:
         model_scenes.append(sdf_primitives.CylinderSDF(point=[0, 0, 0], axis="y", radius=r)._compute)
-        sdf_parameters.append({"R": r, "operator": operator_codes["Cylinder"]})
+        sdf_parameters.append({"R": float(r), "operator": float(operator_codes["Cylinder"])})
 
     # Torus
     for R in radii:
         r_small = R * torus_ratio
         model_scenes.append(sdf_primitives.TorusSDF(center=[0, 0, 0], R=R, r=r_small)._compute)
-        sdf_parameters.append({"R": R, "r_small": r_small, "operator": operator_codes["Torus"]})
+        sdf_parameters.append({
+            "R": float(R), 
+            "r_small": float(r_small), 
+            "operator": float(operator_codes["Torus"])
+        })
 
     # ---------------------------
     # Train the unified model
@@ -89,7 +93,7 @@ if __name__ == "__main__":
     print(f"\n[INFO] Training model: {model_name} with {len(model_scenes)} total scenes...")
     trainer.train_models(
         model_scenes={model_name: model_scenes},  # one model, many scenes
-        sdf_parameters=sdf_parameters,
+        sdf_parameters={model_name: sdf_parameters},  # per-scene params
         latentDim=0,  # no latent code — direct param training
         resume=True
     )

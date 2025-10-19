@@ -1,12 +1,11 @@
 import os
 from typing import Dict, List, Callable, Optional
 import TrainAShape
-import VisualizeAShape
 
 class DeepSDFTrainer:
     """
-    Wrapper to train and visualize multiple DeepSDF models with multiple scenes.
-    Each scene now has its own folder:
+    Wrapper to train multiple DeepSDF models with multiple scenes.
+    Each scene has its own folder:
         trained_models/
             model_name/
                 ModelParameters/
@@ -30,9 +29,9 @@ class DeepSDFTrainer:
     def train_models(
         self,
         model_scenes: Dict[str, List[Callable]],
+        sdf_parameters: Optional[Dict[str, List[dict]]] = None,
         starting_ids: Optional[Dict[str, int]] = None,
         resume: bool = True,
-        sdf_parameters: Optional[List] = None,
         latentDim: int = 1,
         FORCE_ONLY_FINAL_SNAPSHOT: bool = False,
         domainRadius: float = 1.0,
@@ -40,32 +39,49 @@ class DeepSDFTrainer:
         """
         Train multiple models, each with multiple scenes.
 
-        Args:
-            model_scenes (Dict[str, List[Callable]]): Dict of model names -> list of SDF functions (one per scene)
-            starting_ids (Dict[str, int], optional): Starting scene_id per model (default 0)
-            resume (bool): If True, continue training from latest checkpoints
-            sdf_parameters (List[Tuple[float, float]], optional): List of (low, high) parameter ranges for SDF conditioning
-            latentDim (int): Latent vector dimension
-            FORCE_ONLY_FINAL_SNAPSHOT (bool): If True, only save the last snapshot
-            domainRadius (float): Sampling domain radius
+        Parameters
+        ----------
+        model_scenes : dict[str, list[Callable]]
+            Dictionary mapping model names → list of SDF functions correlating to scenes.
+        sdf_parameters : dict[str, list[dict]], optional
+            Dictionary mapping model names → list of dicts per scene.
+            Each dict specifies parameter ranges: {param_name: (low, high)}.
+            Only parameters to be sampled should be included.
+        starting_ids : dict[str, int], optional
+            Optional starting scene ID per model.
+        resume : bool
+            Whether to resume from existing checkpoints.
+        latentDim : int
+            Latent vector dimension.
+        FORCE_ONLY_FINAL_SNAPSHOT : bool
+            Only save the final epoch snapshot if True.
+        domainRadius : float
+            Maximum absolute value for 3D query points.
         """
+        if sdf_parameters is None:
+            sdf_parameters = {}
         if starting_ids is None:
             starting_ids = {name: 0 for name in model_scenes}
 
         for model_name, sdfs in model_scenes.items():
             start_id = starting_ids.get(model_name, 0)
-            scene_ids = [start_id + idx for idx in range(len(sdfs))]
+            scene_ids = [start_id + i for i in range(len(sdfs))]
+
+            # Get per-scene parameter dicts
+            model_sdf_params = sdf_parameters.get(model_name, [{}] * len(sdfs))
 
             print(f"[INFO] Training model '{model_name}' with {len(sdfs)} scenes…")
 
-            for scene_id, sdf_func in zip(scene_ids, sdfs):
+            for scene_id, sdf_func, params in zip(scene_ids, sdfs, model_sdf_params):
                 print(f"  -> Training scene {scene_id:03d} for model '{model_name}'")
 
+                # Wrap per-scene sdf_parameters in a list for trainAShape
                 TrainAShape.trainAShape(
+                    base_directory=self.base_dir,
                     model_name=model_name,
                     sdf_function=sdf_func,
                     scene_ids=[scene_id],
-                    sdf_parameters=sdf_parameters,   
+                    sdf_parameters=[params],
                     latentDim=latentDim,
                     resume=resume,
                     FORCE_ONLY_FINAL_SNAPSHOT=FORCE_ONLY_FINAL_SNAPSHOT,
