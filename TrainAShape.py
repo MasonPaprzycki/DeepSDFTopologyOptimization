@@ -109,12 +109,12 @@ def trainAShape(
                 "dropout": list(range(6)),
                 "dropout_prob": 0.2,
                 "norm_layers": list(range(6)),
-                "latent_in": [2],
+                "latent_in": [2] if latentDim > 0 else [],
                 "xyz_in_all": False,
                 "use_tanh": False,
                 "latent_dropout": False,
                 "weight_norm": True,
-                "geom_dimension": n_params + 3
+                "geom_dimension": n_params + 3 + (1 if isinstance(sdf_function, dict) and len(sdf_function) > 1 else 0)
             },
             "CodeLength": latentDim,
             "NumEpochs": 500,
@@ -190,11 +190,12 @@ def trainAShape(
         # Maximizes positive samples until 50/50 split between positive/negative
         # This can be adjusted as needed but is theoretically ideal for training
 
+        # ---------------- SDF Samples ----------------
         samples_file = os.path.join(samples_dir, f"{scene_key}.npz")
         if not os.path.exists(samples_file):
             n_points = 50_000
 
-            # Flatten sdf_parameters if passed as list of dicts
+            # Flatten sdf_parameters if passed as dict/list
             param_ranges = []
             if sdf_parameters:
                 for p in sdf_parameters:
@@ -202,32 +203,43 @@ def trainAShape(
                         for v in p.values():
                             if isinstance(v, (list, tuple)) and len(v) == 2:
                                 lo, hi = v
-                                if hi > lo:
+                                if hi >= lo:
                                     param_ranges.append((lo, hi))
                     elif isinstance(p, (list, tuple)) and len(p) == 2:
                         lo, hi = p
-                        if hi > lo:
+                        if hi >= lo:
                             param_ranges.append((lo, hi))
 
             n_params = len(param_ranges)
-            queries = torch.empty(n_points, 3 + n_params)
+            n_ops = len(sdf_function)  # number of discrete operators
 
-            # sample xyz in bounding cube
+            queries = torch.empty(n_points, 3 + 1 + n_params)  # xyz + operator + params
+
+            # sample xyz uniformly in bounding cube
             queries[:, :3] = (torch.rand(n_points, 3) * 2 - 1) * domainRadius
 
-            # sample parameters
+            # sample operator codes uniformly
+            operator_indices = np.random.choice(n_ops, n_points)
+            queries[:, 3] = torch.tensor(operator_indices, dtype=torch.float32)
+
+            # sample parameters using the same logic as before
             if n_params > 0:
-                lows  = torch.tensor([lo for lo, hi in param_ranges], dtype=torch.float32)
+                lows = torch.tensor([lo for lo, hi in param_ranges], dtype=torch.float32)
                 highs = torch.tensor([hi for lo, hi in param_ranges], dtype=torch.float32)
                 param_rand = torch.rand(n_points, n_params)
-                queries[:, 3:] = lows + param_rand * (highs - lows)
+                queries[:, 4:] = lows + param_rand * (highs - lows)
 
-            # evaluate sdf
-            sdf_vals = sdf_function(queries).squeeze(1)
+            # evaluate sdf using the operator-specific function
+            sdf_vals = torch.empty(n_points)
+            operator_keys = list(sdf_function.keys())
+            for i in range(n_points):
+                op_key = operator_keys[int(queries[i, 3])]
+                sdf_vals[i] = sdf_function[op_key](queries[i, :3].unsqueeze(0)).squeeze()
+
             data = torch.cat([queries, sdf_vals.unsqueeze(1)], dim=1).numpy()
 
             # separate positive/negative samples
-            idx = 3 + n_params
+            idx = 3 + 1 + n_params
             pos = data[np.abs(data[:, idx]) < specs["ClampingDistance"]]
             neg = data[np.abs(data[:, idx]) >= specs["ClampingDistance"]]
             n_pos = min(len(pos), specs["SamplesPerScene"] // 2)
@@ -238,6 +250,7 @@ def trainAShape(
                 neg = neg[np.random.choice(len(neg), n_neg, replace=False)]
 
             np.savez_compressed(samples_file, pos=pos, neg=neg)
+
 
         # ---------------- Train ----------------
         old_cwd = os.getcwd()
