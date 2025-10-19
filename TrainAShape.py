@@ -55,6 +55,8 @@ def trainAShape(
     latentDim=1,
     FORCE_ONLY_FINAL_SNAPSHOT=False
 ):
+    # Normalize global sdf_parameters (for specs)
+    n_params = 0
     if sdf_parameters is None:
         sdf_parameters = []
     param_names = []
@@ -65,21 +67,18 @@ def trainAShape(
 
         valid = {}
         for k, v in param_ranges.items():
-            # only accept real numeric (low, high)
             if isinstance(v, (list, tuple)) and len(v) == 2:
                 lo, hi = v
                 if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and hi > lo:
                     valid[k] = (lo, hi)
-            # otherwise ignore silently
-
-        # overwrite param_ranges with only valid entries
         param_ranges = valid
 
-        # flatten
+        # flatten for internal sampling if needed
         sdf_parameters = list(param_ranges.values())
 
+        n_params = len(sdf_parameters)  # number of sampled parameters for this model
 
-
+    
     # ---------------- Folder setup ----------------
     root = os.path.abspath(os.path.join(base_directory, model_name))  # absolute path
     split_dir = os.path.abspath(os.path.join(root, "split"))
@@ -115,7 +114,7 @@ def trainAShape(
                 "use_tanh": False,
                 "latent_dropout": False,
                 "weight_norm": True,
-                "geom_dimension": 3 + len(sdf_parameters)
+                "geom_dimension": n_params + 3
             },
             "CodeLength": latentDim,
             "NumEpochs": 500,
@@ -194,29 +193,41 @@ def trainAShape(
         samples_file = os.path.join(samples_dir, f"{scene_key}.npz")
         if not os.path.exists(samples_file):
             n_points = 50_000
-            queries = torch.empty(n_points, 3 + len(sdf_parameters))
+
+            # Flatten sdf_parameters if passed as list of dicts
+            param_ranges = []
+            if sdf_parameters:
+                for p in sdf_parameters:
+                    if isinstance(p, dict):
+                        for v in p.values():
+                            if isinstance(v, (list, tuple)) and len(v) == 2:
+                                lo, hi = v
+                                if hi > lo:
+                                    param_ranges.append((lo, hi))
+                    elif isinstance(p, (list, tuple)) and len(p) == 2:
+                        lo, hi = p
+                        if hi > lo:
+                            param_ranges.append((lo, hi))
+
+            n_params = len(param_ranges)
+            queries = torch.empty(n_points, 3 + n_params)
 
             # sample xyz in bounding cube
             queries[:, :3] = (torch.rand(n_points, 3) * 2 - 1) * domainRadius
-            # sample parameters in specified ranges (only if present)
-            if sdf_parameters and len(sdf_parameters) > 0:
-                # ensure they are all valid (tuples of length 2)
-                valid_ranges = []
-                for p in sdf_parameters:
-                    if isinstance(p, (list, tuple)) and len(p) == 2:
-                        valid_ranges.append(p)
-                    else:
-                        raise ValueError(f"Invalid param range {p}, expected (low, high).")
-                lows  = torch.tensor([lo for lo, hi in valid_ranges], dtype=torch.float32)
-                highs = torch.tensor([hi for lo, hi in valid_ranges], dtype=torch.float32)
-                param_rand = torch.rand(n_points, len(valid_ranges))
+
+            # sample parameters
+            if n_params > 0:
+                lows  = torch.tensor([lo for lo, hi in param_ranges], dtype=torch.float32)
+                highs = torch.tensor([hi for lo, hi in param_ranges], dtype=torch.float32)
+                param_rand = torch.rand(n_points, n_params)
                 queries[:, 3:] = lows + param_rand * (highs - lows)
 
             # evaluate sdf
             sdf_vals = sdf_function(queries).squeeze(1)
             data = torch.cat([queries, sdf_vals.unsqueeze(1)], dim=1).numpy()
 
-            idx = 3 + len(sdf_parameters)
+            # separate positive/negative samples
+            idx = 3 + n_params
             pos = data[np.abs(data[:, idx]) < specs["ClampingDistance"]]
             neg = data[np.abs(data[:, idx]) >= specs["ClampingDistance"]]
             n_pos = min(len(pos), specs["SamplesPerScene"] // 2)
@@ -225,6 +236,7 @@ def trainAShape(
                 pos = pos[np.random.choice(len(pos), n_pos, replace=False)]
             if len(neg) > 0:
                 neg = neg[np.random.choice(len(neg), n_neg, replace=False)]
+
             np.savez_compressed(samples_file, pos=pos, neg=neg)
 
         # ---------------- Train ----------------
@@ -234,18 +246,16 @@ def trainAShape(
             print(f"[DEBUG] Changed directory to: {os.getcwd()}")
 
             logs_file = os.path.join(root, "Logs.pth")
-
-            # --- NEW: create a dummy log file if missing to satisfy DeepSDF ---
             if not os.path.exists(logs_file):
-                print(f"[WARN] Logs.pth not found — creating a blank log so training can resume.")
+                print(f"[WARN] Logs.pth not found — creating a minimal log so training can resume.")
                 torch.save(
                     {
-                        "loss": [],
-                        "learning_rate": [],
-                        "timing": [],
-                        "latent_magnitude": [],
-                        "param_magnitude": [],
-                        "epoch": [],
+                        "loss": [0.0],              # at least 1 element
+                        "learning_rate": [0.001],   # at least 1 element
+                        "timing": [0.0],
+                        "latent_magnitude": [0.0],
+                        "param_magnitude": {"dummy": [0.0]},
+                        "epoch": [0],               # 0 is fine for start
                     },
                     logs_file,
                 )

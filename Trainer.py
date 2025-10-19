@@ -42,7 +42,7 @@ class DeepSDFTrainer:
         Parameters
         ----------
         model_scenes : dict[str, list[Callable]]
-            Dictionary mapping model names → list of SDF functions correlating to scenes.
+            Dictionary mapping scene names → list of SDF functions correlating to scenes.
         sdf_parameters : dict[str, list[dict]], optional
             Dictionary mapping model names → list of dicts per scene.
             Each dict specifies parameter ranges: {param_name: (low, high)}.
