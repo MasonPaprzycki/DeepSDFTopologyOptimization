@@ -1,5 +1,6 @@
 import os
 import json
+import random
 from typing import Callable, Dict, List, Tuple
 import torch
 import numpy as np
@@ -45,6 +46,7 @@ patch_get_instance_filenames()
 # Any such useful informtion could be extracted from this script with
 # minor modifications however. 
 # ------------------------
+
 SDFCallable = Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor]
 def trainAShape(
     base_directory: str,
@@ -57,19 +59,42 @@ def trainAShape(
 ):
 
     # ------------- derive global param space from scenes -------------
-    global_param_ranges = []
-    for scene_ops in scenes.values():
-        for op_params in scene_ops.values():
+    global_add_param_ranges = []
+    scene_names = list(scenes.keys())
+    global_add_num_params = []
+
+    for scene in scenes.values():
+        scene_param_ranges = []
+        i =0
+        for op_params in scene.values():
             if isinstance(op_params, (list, tuple)):
                 for rng in op_params:
                     if isinstance(rng, (list, tuple)) and len(rng) == 2:
                         lo, hi = rng
                         if hi >= lo:
-                            global_param_ranges.append((lo, hi))
+                            scene_param_ranges.append((lo, hi))
+            i+=1
+        scene_add_n_params = len(scene_param_ranges)/len(scene.values())
+        if scene_add_n_params != int(scene_add_n_params):
+            raise ValueError("Inconsistent number of parameters across operators in scene" + scene_names[i])
+        
+        if len(scene.values()) >1: scene_add_n_params +=1 
 
-    n_params = len(global_param_ranges)
-    param_names = [f"p{i}" for i in range(n_params)]
-    param_ranges = global_param_ranges
+        for i in range(0,len(scene_param_ranges)-1):
+            if (scene_param_ranges[i] != scene_param_ranges[i+1]):
+                raise Warning(f"Inconsistent range of parameters between operators : {i} and {i+1} probably not the best for training")
+            
+        global_add_param_ranges.append(scene_param_ranges)
+        global_add_num_params.append(int(scene_add_n_params))
+
+    for i in range(0,len(global_add_param_ranges)-1):
+        if (global_add_param_ranges[i].__len__() != global_add_param_ranges[i+1].__len__()):
+            raise ValueError(f"Inconsistent number of parameters between scenes : {list(scenes.keys())[i]} and {list(scenes.keys())[i+1]} probably not the best for training")
+        
+        if (global_add_param_ranges[i] != global_add_param_ranges[i+1]):
+            raise ValueError(f"Inconsistent range of parameters between scenes : {list(scenes.keys())[i]} and {list(scenes.keys())[i+1]} probably not the best for training")
+    
+    geom_n_params = global_add_num_params[0] +3 # all scenes must have same number of params
 
     
     
@@ -108,7 +133,7 @@ def trainAShape(
                 "use_tanh": False,
                 "latent_dropout": False,
                 "weight_norm": True,
-                "geom_dimension": n_params + 3
+                "geom_dimension": geom_n_params
             },
             "CodeLength": latentDim,
             "NumEpochs": 500,
@@ -124,9 +149,7 @@ def trainAShape(
             "ClampingDistance": 0.1,
             "CodeRegularization": True,
             "CodeRegularizationLambda": 1e-4,
-            "CodeBound": 1.0,
-            "ParamNames": param_names,
-            "ParamRanges": param_ranges
+            "CodeBound": 1.0
         }
 
     if FORCE_ONLY_FINAL_SNAPSHOT:
@@ -152,8 +175,7 @@ def trainAShape(
         json.dump(split_dict, f, indent=2)
 
     # ---------------- Training Loop ----------------
-    for scene_id in scenes.keys():
-        sdf_parameters =scenes[scene_id]
+    for scene_idx, (scene_id, sdf_parameters) in enumerate(scenes.items()):
         scene_key = f"{model_name.lower()}_{scene_id:03d}"
         scene_folder = os.path.join(scenes_dir, f"{scene_id:03d}")
         scene_latent_dir = os.path.join(scene_folder, "LatentCodes")
@@ -181,84 +203,78 @@ def trainAShape(
         else:
             print(f"[INFO] Starting fresh training for {model_name}")
 
-        # ---------------- SDF Samples ----------------
-        # Maximizes positive samples until 50/50 split between positive/negative
-        # This can be adjusted as needed but is theoretically ideal for training
-
-        # ---------------- SDF Samples ----------------
+        # --- SDF Samples (fixed) ---
         samples_file = os.path.join(samples_dir, f"{scene_key}.npz")
         if not os.path.exists(samples_file):
-            n_points = 50_000
+            n_points = 50000
 
-            # Flatten sdf_parameters if passed as dict/list
-            param_ranges = []
-            if sdf_parameters:
-                for p in sdf_parameters:
-                    if isinstance(p, dict):
-                        for v in p.values():
-                            if isinstance(v, (list, tuple)) and len(v) == 2:
-                                lo, hi = v
-                                if hi >= lo:
-                                    param_ranges.append((lo, hi))
-                    elif isinstance(p, (list, tuple)) and len(p) == 2:
-                        lo, hi = p
-                        if hi >= lo:
-                            param_ranges.append((lo, hi))
-
-            n_params = len(param_ranges)
-            n_ops = len(sdf_parameters)  # number of discrete operators
-
-            queries = torch.empty(n_points, 3 + 1 + n_params)  # xyz + operator + params
-
-            # sample xyz uniformly in bounding cube
-            queries[:, :3] = (torch.rand(n_points, 3) * 2 - 1) * domainRadius
-
-            # sample operator codes uniformly
-            operator_indices = np.random.choice(n_ops, n_points)
-            queries[:, 3] = torch.tensor(operator_indices, dtype=torch.float32)
-
-            # sample parameters using the same logic as before
-            if n_params > 0:
-                lows = torch.tensor([lo for lo, hi in param_ranges], dtype=torch.float32)
-                highs = torch.tensor([hi for lo, hi in param_ranges], dtype=torch.float32)
-                param_rand = torch.rand(n_points, n_params)
-                queries[:, 4:] = lows + param_rand * (highs - lows)
-
-            # evaluate sdf using the operator-specific function
-            sdf_vals = torch.empty(n_points)
+            # ---------------- Operator setup ----------------
             operator_keys = list(sdf_parameters.keys())
+            random.shuffle(operator_keys)
+            n_ops = len(operator_keys)
 
-            for i in range(n_points):
-                op_idx = int(queries[i, 3])
-                op_key = operator_keys[op_idx]
+            param_ranges_flat = global_add_param_ranges[scene_idx]
+            add_n_params_not_operator = global_add_num_params[scene_idx]
 
-                xyz = queries[i, :3].unsqueeze(0)  # (1,3)
-                # unpack SDF callable and its param ranges
-                sdf_callable, sdf_param_ranges = sdf_parameters[op_key]
+            # ---------------- Sample operators and params ----------------
+            # sample operator index per point (continuous operator trick)
+            op_indices = torch.randint(0, n_ops, (n_points,), dtype=torch.long)
 
-                # compute SDF
-                if sdf_param_ranges:  # if the operator has parameters
-                    num_params = len(sdf_param_ranges)
-                    params = queries[i, 4:4+num_params]
-                else:
-                    params = None
+            # sample xyz coordinates
+            xyz_all = (torch.rand(n_points, 3) * 2 - 1) * domainRadius
 
-                sdf_vals[i] = sdf_callable(xyz, params).squeeze()
+            # prepare param ranges per operator
+            lows = torch.tensor([
+                [lo for lo, _ in param_ranges_flat[i*add_n_params_not_operator:(i+1)*add_n_params_not_operator]]
+                for i in range(n_ops)
+            ], dtype=torch.float32)
+            highs = torch.tensor([
+                [hi for _, hi in param_ranges_flat[i*add_n_params_not_operator:(i+1)*add_n_params_not_operator]]
+                for i in range(n_ops)
+            ], dtype=torch.float32)
 
+            # sample params per point
+            rand_params = torch.rand((n_points, add_n_params_not_operator), dtype=torch.float32)
+            sampled_params = lows[op_indices] + rand_params * (highs - lows[op_indices])
+
+            # assemble queries: [x, y, z, operator, params...]
+            queries = torch.cat([
+                xyz_all,
+                op_indices.float().unsqueeze(1),  # operator as continuous value
+                sampled_params
+            ], dim=1)
+
+            # ---------------- Evaluate SDF ----------------
+            sdf_vals = torch.empty(n_points, dtype=torch.float32)
+            for i, key in enumerate(operator_keys):
+                mask = (op_indices == i)
+                if mask.any():
+                    sdf_fn, _ = sdf_parameters[key]   # unpack the callable
+                    sdf_vals[mask] = sdf_fn(xyz_all[mask], sampled_params[mask])
+
+            # ---------------- Clamping ----------------
             data = torch.cat([queries, sdf_vals.unsqueeze(1)], dim=1).numpy()
+            sdf_col_idx = data.shape[1] - 1  # sdf is the last column
 
-            # separate positive/negative samples
-            idx = 3 + 1 + n_params
-            pos = data[np.abs(data[:, idx]) < specs["ClampingDistance"]]
-            neg = data[np.abs(data[:, idx]) >= specs["ClampingDistance"]]
+            pos = data[np.abs(data[:, sdf_col_idx]) < specs["ClampingDistance"]]
+            neg = data[np.abs(data[:, sdf_col_idx]) >= specs["ClampingDistance"]]
+
             n_pos = min(len(pos), specs["SamplesPerScene"] // 2)
             n_neg = specs["SamplesPerScene"] - n_pos
-            if len(pos) > 0:
-                pos = pos[np.random.choice(len(pos), n_pos, replace=False)]
-            if len(neg) > 0:
-                neg = neg[np.random.choice(len(neg), n_neg, replace=False)]
 
+            if len(pos) > 0:
+                pos = pos[np.random.choice(len(pos), n_pos, replace=len(pos) < n_pos)]
+            else:
+                pos = np.empty((0, data.shape[1]), dtype=data.dtype)
+
+            if len(neg) > 0:
+                neg = neg[np.random.choice(len(neg), n_neg, replace=len(neg) < n_neg)]
+            else:
+                neg = np.empty((0, data.shape[1]), dtype=data.dtype)
+
+            # ---------------- Save ----------------
             np.savez_compressed(samples_file, pos=pos, neg=neg)
+
 
 
         # ---------------- Train ----------------
