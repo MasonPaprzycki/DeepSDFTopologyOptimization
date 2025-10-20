@@ -206,55 +206,59 @@ def trainAShape(
         # --- SDF Samples (fixed) ---
         samples_file = os.path.join(samples_dir, f"{scene_key}.npz")
         if not os.path.exists(samples_file):
-            n_points = 50000
+            sample_points_per_operator = 50000
 
             # ---------------- Operator setup ----------------
             operator_keys = list(sdf_parameters.keys())
-            random.shuffle(operator_keys)
+            random.shuffle(operator_keys)  # shuffle operators
             n_ops = len(operator_keys)
 
             param_ranges_flat = global_add_param_ranges[scene_idx]
             add_n_params_not_operator = global_add_num_params[scene_idx]
 
-            # ---------------- Sample operators and params ----------------
-            # sample operator index per point (continuous operator trick)
-            op_indices = torch.randint(0, n_ops, (n_points,), dtype=torch.long)
+            # ---------------- Sample XYZ coordinates ----------------
+            xyz_all = (torch.rand(sample_points_per_operator, 3) * 2 - 1) * domainRadius
 
-            # sample xyz coordinates
-            xyz_all = (torch.rand(n_points, 3) * 2 - 1) * domainRadius
-
-            # prepare param ranges per operator
+            # ---------------- Prepare param ranges per operator ----------------
             lows = torch.tensor([
                 [lo for lo, _ in param_ranges_flat[i*add_n_params_not_operator:(i+1)*add_n_params_not_operator]]
                 for i in range(n_ops)
             ], dtype=torch.float32)
+
             highs = torch.tensor([
                 [hi for _, hi in param_ranges_flat[i*add_n_params_not_operator:(i+1)*add_n_params_not_operator]]
                 for i in range(n_ops)
             ], dtype=torch.float32)
 
-            # sample params per point
-            rand_params = torch.rand((n_points, add_n_params_not_operator), dtype=torch.float32)
-            sampled_params = lows[op_indices] + rand_params * (highs - lows[op_indices])
+            # ---------------- Allocate storage ----------------
+            queries_list = []
+            sdf_vals_list = []
 
-            # assemble queries: [x, y, z, operator, params...]
-            queries = torch.cat([
-                xyz_all,
-                op_indices.float().unsqueeze(1),  # operator as continuous value
-                sampled_params
-            ], dim=1)
-
-            # ---------------- Evaluate SDF ----------------
-            sdf_vals = torch.empty(n_points, dtype=torch.float32)
+            # ---------------- Sample per operator ----------------
             for i, key in enumerate(operator_keys):
-                mask = (op_indices == i)
-                if mask.any():
-                    sdf_fn, _ = sdf_parameters[key]   # unpack the callable
-                    sdf_vals[mask] = sdf_fn(xyz_all[mask], sampled_params[mask])
+                # sample parameters for all points for this operator
+                rand_params = torch.rand((sample_points_per_operator, add_n_params_not_operator), dtype=torch.float32)
+                sampled_params = lows[i] + rand_params * (highs[i] - lows[i])
+
+                # assemble queries: [x, y, z, operator_key_as_float?, params...]
+                # optionally encode operator as float or just leave out if not needed
+                op_value = torch.full((sample_points_per_operator, 1), float(i))  # optional
+                queries_op = torch.cat([xyz_all, op_value, sampled_params], dim=1)
+
+                # evaluate SDF
+                sdf_fn, _ = sdf_parameters[key]
+                sdf_op_vals = sdf_fn(xyz_all, sampled_params)
+
+                queries_list.append(queries_op)
+                sdf_vals_list.append(sdf_op_vals.unsqueeze(1))
+
+            # ---------------- Combine all operators ----------------
+            queries = torch.cat(queries_list, dim=0)
+            sdf_vals = torch.cat(sdf_vals_list, dim=0)
 
             # ---------------- Clamping ----------------
-            data = torch.cat([queries, sdf_vals.unsqueeze(1)], dim=1).numpy()
-            sdf_col_idx = data.shape[1] - 1  # sdf is the last column
+            data = torch.cat([queries, sdf_vals], dim=1).numpy()
+            sdf_col_idx = data.shape[1] - 1
 
             pos = data[np.abs(data[:, sdf_col_idx]) < specs["ClampingDistance"]]
             neg = data[np.abs(data[:, sdf_col_idx]) >= specs["ClampingDistance"]]
@@ -268,7 +272,7 @@ def trainAShape(
                 pos = np.empty((0, data.shape[1]), dtype=data.dtype)
 
             if len(neg) > 0:
-                neg = neg[np.random.choice(len(neg), n_neg, replace=len(neg) < n_neg)]
+                neg = np.random.choice(len(neg), n_neg, replace=len(neg) < n_neg)
             else:
                 neg = np.empty((0, data.shape[1]), dtype=data.dtype)
 
