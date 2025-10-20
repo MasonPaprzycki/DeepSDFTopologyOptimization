@@ -1,5 +1,6 @@
 import os
 import json
+from typing import Callable, Dict, List, Tuple
 import torch
 import numpy as np
 import DeepSDFStruct.deep_sdf.data as deep_data
@@ -44,40 +45,33 @@ patch_get_instance_filenames()
 # Any such useful informtion could be extracted from this script with
 # minor modifications however. 
 # ------------------------
+SDFCallable = Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor]
 def trainAShape(
     base_directory: str,
-    model_name,
-    sdf_function,
-    scene_ids,
-    resume=True,
-    domainRadius=1.0,
-    sdf_parameters=None,
-    latentDim=1,
-    FORCE_ONLY_FINAL_SNAPSHOT=False
+    model_name: str,
+    scenes: Dict[str, Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]],
+    resume: bool = True,
+    domainRadius: float = 1.0,
+    latentDim: int = 1,
+    FORCE_ONLY_FINAL_SNAPSHOT: bool = False
 ):
-    # Normalize global sdf_parameters (for specs)
-    n_params = 0
-    if sdf_parameters is None:
-        sdf_parameters = []
-    param_names = []
-    param_ranges = {}
-    if isinstance(sdf_parameters, dict):
-        param_names = list(sdf_parameters.keys())
-        param_ranges = dict(sdf_parameters)  # preserve original before flattening
 
-        valid = {}
-        for k, v in param_ranges.items():
-            if isinstance(v, (list, tuple)) and len(v) == 2:
-                lo, hi = v
-                if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) and hi > lo:
-                    valid[k] = (lo, hi)
-        param_ranges = valid
+    # ------------- derive global param space from scenes -------------
+    global_param_ranges = []
+    for scene_ops in scenes.values():
+        for op_params in scene_ops.values():
+            if isinstance(op_params, (list, tuple)):
+                for rng in op_params:
+                    if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                        lo, hi = rng
+                        if hi >= lo:
+                            global_param_ranges.append((lo, hi))
 
-        # flatten for internal sampling if needed
-        sdf_parameters = list(param_ranges.values())
+    n_params = len(global_param_ranges)
+    param_names = [f"p{i}" for i in range(n_params)]
+    param_ranges = global_param_ranges
 
-        n_params = len(sdf_parameters)  # number of sampled parameters for this model
-
+    
     
     # ---------------- Folder setup ----------------
     root = os.path.abspath(os.path.join(base_directory, model_name))  # absolute path
@@ -114,7 +108,7 @@ def trainAShape(
                 "use_tanh": False,
                 "latent_dropout": False,
                 "weight_norm": True,
-                "geom_dimension": n_params + 3 + (1 if isinstance(sdf_function, dict) and len(sdf_function) > 1 else 0)
+                "geom_dimension": n_params + 3
             },
             "CodeLength": latentDim,
             "NumEpochs": 500,
@@ -150,7 +144,7 @@ def trainAShape(
     else:
         split_dict = {"train": {}}
     split_dict.setdefault("train", {}).setdefault(model_name, [])
-    for scene_id in scene_ids:
+    for scene_id in scenes.keys():
         key = f"{model_name.lower()}_{scene_id:03d}"
         if key not in split_dict["train"][model_name]:
             split_dict["train"][model_name].append(key)
@@ -158,7 +152,8 @@ def trainAShape(
         json.dump(split_dict, f, indent=2)
 
     # ---------------- Training Loop ----------------
-    for scene_id in scene_ids:
+    for scene_id in scenes.keys():
+        sdf_parameters =scenes[scene_id]
         scene_key = f"{model_name.lower()}_{scene_id:03d}"
         scene_folder = os.path.join(scenes_dir, f"{scene_id:03d}")
         scene_latent_dir = os.path.join(scene_folder, "LatentCodes")
@@ -211,7 +206,7 @@ def trainAShape(
                             param_ranges.append((lo, hi))
 
             n_params = len(param_ranges)
-            n_ops = len(sdf_function)  # number of discrete operators
+            n_ops = len(sdf_parameters)  # number of discrete operators
 
             queries = torch.empty(n_points, 3 + 1 + n_params)  # xyz + operator + params
 
@@ -231,10 +226,24 @@ def trainAShape(
 
             # evaluate sdf using the operator-specific function
             sdf_vals = torch.empty(n_points)
-            operator_keys = list(sdf_function.keys())
+            operator_keys = list(sdf_parameters.keys())
+
             for i in range(n_points):
-                op_key = operator_keys[int(queries[i, 3])]
-                sdf_vals[i] = sdf_function[op_key](queries[i, :3].unsqueeze(0)).squeeze()
+                op_idx = int(queries[i, 3])
+                op_key = operator_keys[op_idx]
+
+                xyz = queries[i, :3].unsqueeze(0)  # (1,3)
+                # unpack SDF callable and its param ranges
+                sdf_callable, sdf_param_ranges = sdf_parameters[op_key]
+
+                # compute SDF
+                if sdf_param_ranges:  # if the operator has parameters
+                    num_params = len(sdf_param_ranges)
+                    params = queries[i, 4:4+num_params]
+                else:
+                    params = None
+
+                sdf_vals[i] = sdf_callable(xyz, params).squeeze()
 
             data = torch.cat([queries, sdf_vals.unsqueeze(1)], dim=1).numpy()
 

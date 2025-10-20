@@ -75,13 +75,16 @@ class DeepSDFTrainer:
             for scene_id, sdf_func, params in zip(scene_ids, sdfs, model_sdf_params):
                 print(f"  -> Training scene {scene_id:03d} for model '{model_name}'")
 
-                # Wrap per-scene sdf_parameters in a list for trainAShape
+                scenes_dict = {
+                    model_name.lower(): {
+                        scene_id: (sdf_func, [(v[0], v[1]) for v in params.values()] if params else [])
+                    }
+                }
+
                 TrainAShape.trainAShape(
                     base_directory=self.base_dir,
                     model_name=model_name,
-                    sdf_function=sdf_func,
-                    scene_ids=[scene_id],
-                    sdf_parameters=[params],
+                    scenes=scenes_dict,
                     latentDim=latentDim,
                     resume=resume,
                     FORCE_ONLY_FINAL_SNAPSHOT=FORCE_ONLY_FINAL_SNAPSHOT,
