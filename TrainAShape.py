@@ -35,8 +35,6 @@ def patch_get_instance_filenames():
 patch_get_instance_filenames()
 
 # ------------------------
-# Train a model on shapes
-# Must have function inputs and behave like a continuous SDF function
 #
 # Caution! 
 # Upon resuming training this script generates log.pth files to satisfy DeepSDF's API. 
@@ -57,6 +55,14 @@ def trainAShape(
     latentDim: int = 1,
     FORCE_ONLY_FINAL_SNAPSHOT: bool = False
 ):
+    """
+    Train a DeepSDF model on SDFs with compatibility to interpolate between SDFs.
+    Interpolation is achieved via operator parameters. 
+    Scenes and operators for a scene are wrapped to contain additional input parameters beyond xyz.
+    The only condition for compatibility is that all scenes and operators must have the same number of additional parameters.
+    Additionally the model should only be trained on watertight smooth shapes for best results.
+    If only one opertor is provided per scene the operator code input is omitted.
+    """
 
     # ------------- derive global param space from scenes -------------
     global_add_param_ranges = []
@@ -206,7 +212,6 @@ def trainAShape(
         # --- SDF Samples (fixed) ---
         samples_file = os.path.join(samples_dir, f"{scene_key}.npz")
         if not os.path.exists(samples_file):
-            sample_points_per_operator = 50000
 
             # ---------------- Operator setup ----------------
             operator_keys = list(sdf_parameters.keys())
@@ -214,72 +219,77 @@ def trainAShape(
             n_ops = len(operator_keys)
 
             param_ranges_flat = global_add_param_ranges[scene_idx]
-            add_n_params_not_operator = global_add_num_params[scene_idx]
+            add_n_params_not_operator = global_add_num_params[scene_idx] -1 if n_ops >1 else global_add_num_params[scene_idx]
 
-            # ---------------- Sample XYZ coordinates ----------------
-            xyz_all = (torch.rand(sample_points_per_operator, 3) * 2 - 1) * domainRadius
+            # ---------------- Adaptive sampling per operator ----------------
+            # Attempts to sample 50/50 split of inside/outside points per operator
 
-            # ---------------- Prepare param ranges per operator ----------------
-            lows = torch.tensor([
-                [lo for lo, _ in param_ranges_flat[i*add_n_params_not_operator:(i+1)*add_n_params_not_operator]]
-                for i in range(n_ops)
-            ], dtype=torch.float32)
+            target_pos = target_neg = specs["SamplesPerScene"] // n_ops// 2
+            pos_list, neg_list = [], []
 
-            highs = torch.tensor([
-                [hi for _, hi in param_ranges_flat[i*add_n_params_not_operator:(i+1)*add_n_params_not_operator]]
-                for i in range(n_ops)
-            ], dtype=torch.float32)
+            batch_size = 5000  # sample in batches to avoid memory blow-up
+            max_attempts = 100  # safety to avoid infinite loops
 
-            # ---------------- Allocate storage ----------------
-            queries_list = []
-            sdf_vals_list = []
-
-            # ---------------- Sample per operator ----------------
             for i, key in enumerate(operator_keys):
-                # sample parameters for all points for this operator
-                rand_params = torch.rand((sample_points_per_operator, add_n_params_not_operator), dtype=torch.float32)
-                sampled_params = lows[i] + rand_params * (highs[i] - lows[i])
+                op_idx = list(sdf_parameters.keys()).index(key)  # find the index in param_ranges_flat
+                low_vals = torch.tensor([lo for lo, _ in param_ranges_flat[op_idx]], dtype=torch.float32)
+                high_vals = torch.tensor([hi for _, hi in param_ranges_flat[op_idx]], dtype=torch.float32)
 
-                # assemble queries: [x, y, z, operator_key_as_float?, params...]
-                # optionally encode operator as float or just leave out if not needed
-                op_value = torch.full((sample_points_per_operator, 1), float(i))  # optional
-                queries_op = torch.cat([xyz_all, op_value, sampled_params], dim=1)
+                attempts = 0
+                while (len(pos_list) < target_pos or len(neg_list) < target_neg) and attempts < max_attempts:
+                    attempts += 1
 
-                # evaluate SDF
-                sdf_fn, _ = sdf_parameters[key]
-                sdf_op_vals = sdf_fn(xyz_all, sampled_params)
+                    # sample xyz
+                    xyz = (torch.rand(batch_size, 3, dtype=torch.float32) * 2 - 1) * domainRadius
 
-                queries_list.append(queries_op)
-                sdf_vals_list.append(sdf_op_vals.unsqueeze(1))
+                    # sample operator parameters
+                    rand_params = torch.rand((batch_size, add_n_params_not_operator), dtype=torch.float32)
+                    sampled_params = low_vals + rand_params * (high_vals - low_vals)
 
-            # ---------------- Combine all operators ----------------
-            queries = torch.cat(queries_list, dim=0)
-            sdf_vals = torch.cat(sdf_vals_list, dim=0)
+                    # continuous operator code (column 4)
+                    op_value = torch.full((batch_size, 1), float(i), dtype=torch.float32)
 
-            # ---------------- Clamping ----------------
-            data = torch.cat([queries, sdf_vals], dim=1).numpy()
-            sdf_col_idx = data.shape[1] - 1
+                    # assemble query: [x, y, z, op_code, params...]
+                    queries_op = torch.cat([xyz, op_value, sampled_params], dim=1)
 
-            pos = data[np.abs(data[:, sdf_col_idx]) < specs["ClampingDistance"]]
-            neg = data[np.abs(data[:, sdf_col_idx]) >= specs["ClampingDistance"]]
+                    # evaluate SDF
+                    sdf_fn, _ = sdf_parameters[key]
+                    sdf_op_vals = sdf_fn(xyz, sampled_params)
+                    if sdf_op_vals.dim() == 1:
+                        sdf_op_vals = sdf_op_vals.unsqueeze(1)
 
-            n_pos = min(len(pos), specs["SamplesPerScene"] // 2)
-            n_neg = specs["SamplesPerScene"] - n_pos
+                    # clamp SDF values ensures that we do not oversample far away points
+                    # this is best for training since the goal is to interpolate between shapes 
+                    # and shapes are encoded implicitly by the zero level set
+                    # thus points far away from the surface are not very useful
 
-            if len(pos) > 0:
-                pos = pos[np.random.choice(len(pos), n_pos, replace=len(pos) < n_pos)]
-            else:
-                pos = np.empty((0, data.shape[1]), dtype=data.dtype)
+                    data = torch.cat([queries_op, sdf_op_vals], dim=1).numpy()
+                    sdf_col_idx = data.shape[1] - 1
+                    batch_pos = data[np.abs(data[:, sdf_col_idx]) < specs["ClampingDistance"]]
+                    batch_neg = data[np.abs(data[:, sdf_col_idx]) >= specs["ClampingDistance"]]
 
-            if len(neg) > 0:
-                neg = np.random.choice(len(neg), n_neg, replace=len(neg) < n_neg)
-            else:
-                neg = np.empty((0, data.shape[1]), dtype=data.dtype)
+                    # append only up to target
+                    if len(pos_list) < target_pos:
+                        remaining = target_pos - len(pos_list)
+                        pos_list.append(batch_pos[:remaining])
+                    if len(neg_list) < target_neg:
+                        remaining = target_neg - len(neg_list)
+                        neg_list.append(batch_neg[:remaining])
 
+            # ---------------- Combine all batches ----------------
+            pos = np.vstack(pos_list) if pos_list else np.empty((0, batch_size), dtype=np.float32)
+            neg = np.vstack(neg_list) if neg_list else np.empty((0, batch_size), dtype=np.float32)
+
+            # Determine if all scenes have exactly one operator
+            all_scenes_single_operator = all(len(scene) == 1 for scene in scenes.values())
+
+            # ... inside your sampling loop, replace the previous trimming block with:
+            if all_scenes_single_operator:
+                pos = np.concatenate([pos[:, :3], pos[:, 4:]], axis=1)
+                neg = np.concatenate([neg[:, :3], neg[:, 4:]], axis=1)
+                
             # ---------------- Save ----------------
             np.savez_compressed(samples_file, pos=pos, neg=neg)
-
-
 
         # ---------------- Train ----------------
         old_cwd = os.getcwd()
