@@ -46,7 +46,7 @@ patch_get_instance_filenames()
 # ------------------------
 
 SDFCallable = Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor]
-def trainAShape(
+def trainModel(
     base_directory: str,
     model_name: str,
     scenes: Dict[str, Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]],
@@ -287,7 +287,7 @@ def trainAShape(
             if all_scenes_single_operator:
                 pos = np.concatenate([pos[:, :3], pos[:, 4:]], axis=1)
                 neg = np.concatenate([neg[:, :3], neg[:, 4:]], axis=1)
-                
+
             # ---------------- Save ----------------
             np.savez_compressed(samples_file, pos=pos, neg=neg)
 
