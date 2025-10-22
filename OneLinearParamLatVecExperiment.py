@@ -1,22 +1,20 @@
 import os
 import sys
 import torch
-import Trainer
-import VisualizeAShape
-import DeepSDFStruct.sdf_primitives as sdf_primitives
 import numpy as np
 import json
+
+import VisualizeAShape
+import DeepSDFStruct.sdf_primitives as sdf_primitives
+import Trainer  # updated wrapper
 
 # ---------------------------
 # Experiment folder
 # ---------------------------
 EXPERIMENT_NAME = "OneLinParamW1dDiscreteInterpolation"
 EXPERIMENT_ROOT = os.path.abspath(os.path.join("experiments", EXPERIMENT_NAME))
+os.makedirs(EXPERIMENT_ROOT, exist_ok=True)
 print(f"[DEBUG] EXPERIMENT_ROOT = {EXPERIMENT_ROOT}")
-
-trainer = Trainer.DeepSDFTrainer(base_dir=os.path.join(EXPERIMENT_ROOT, "trained_models"))
-print(f"[DEBUG] trainer.base_dir = {trainer.base_dir}")
-
 
 # ---------------------------
 # Tee-like logger to capture stdout
@@ -40,48 +38,57 @@ sys.stdout = TeeLogger(os.path.join(EXPERIMENT_ROOT, "results.txt"))
 # Main experiment
 # ---------------------------
 if __name__ == "__main__":
-    trainer = Trainer.DeepSDFTrainer(base_dir=os.path.join(EXPERIMENT_ROOT, "trained_models"))
+    trainer = Trainer.Trainer(base_dir=os.path.join(EXPERIMENT_ROOT, "trained_models"))
 
     # ---------------------------
-    # Define SDF functions and parameters per model
+    # Define SDF functions and parameter ranges per model
     # ---------------------------
     iterations = 19
     radii = np.linspace(0, 1, iterations + 2)[1:-1].tolist()
     torus_ratio = 0.5
 
-    model_scenes = {}
-    sdf_parameters = {}
+    # Models dict
+    models: Trainer.Models = {}
 
-    # Sphere: only radius varies
     # Sphere
-    model_scenes["Sphere"] = [
-        (lambda r: lambda q: sdf_primitives.SphereSDF(center=[0,0,0], radius=r)._compute(q[:, :3]))(r)
+    sphere_sdfs = [
+        (lambda r: lambda q, _: sdf_primitives.SphereSDF(center=[0,0,0], radius=r)._compute(q[:, :3]))(r)
         for r in radii
     ]
+    sphere_params = [{"radius": (r, r)} for r in radii]
+
+    # Wrap the scene dict under a string key "scenes"
+    models["Sphere"] = {"scenes": {i: (sdf, list(p.values())) for i, (sdf, p) in enumerate(zip(sphere_sdfs, sphere_params))}}
 
     # Cylinder
-    model_scenes["Cylinder"] = [
-        (lambda r: lambda q: sdf_primitives.CylinderSDF(point=[0,0,0], axis="y", radius=r)._compute(q[:, :3]))(r)
+    cylinder_sdfs = [
+        (lambda r: lambda q, _: sdf_primitives.CylinderSDF(point=[0,0,0], axis="y", radius=r)._compute(q[:, :3]))(r)
         for r in radii
     ]
+    cylinder_params = [{"radius": (r, r)} for r in radii]
+    models["Cylinder"] = {"scenes": {i: (sdf, list(p.values())) for i, (sdf, p) in enumerate(zip(cylinder_sdfs, cylinder_params))}}
 
     # Torus
-    model_scenes["Torus"] = [
-        (lambda R: lambda q: sdf_primitives.TorusSDF(center=[0,0,0], R=R, r=R*torus_ratio)._compute(q[:, :3]))(R)
+    torus_sdfs = [
+        (lambda R: lambda q, _: sdf_primitives.TorusSDF(center=[0,0,0], R=R, r=R*torus_ratio)._compute(q[:, :3]))(R)
         for R in radii
     ]
+    torus_params = [{"R": (R, R), "r": (R*torus_ratio, R*torus_ratio)} for R in radii]
+    models["Torus"] = {"scenes": {i: (sdf, list(p.values())) for i, (sdf, p) in enumerate(zip(torus_sdfs, torus_params))}}
 
     # CornerSphere
-    model_scenes["CornerSphere"] = [
-        (lambda r: lambda q: sdf_primitives.CornerSpheresSDF(radius=r)._compute(q[:, :3]))(r)
+    cornersphere_sdfs = [
+        (lambda r: lambda q, _: sdf_primitives.CornerSpheresSDF(radius=r)._compute(q[:, :3]))(r)
         for r in radii
     ]
+    cornersphere_params = [{"radius": (r, r)} for r in radii]
+    models["CornerSphere"] = {"scenes": {i: (sdf, list(p.values())) for i, (sdf, p) in enumerate(zip(cornersphere_sdfs, cornersphere_params))}}
 
     # ---------------------------
-    # Train all models
+    # Train all models using updated wrapper
     # ---------------------------
     trainer.train_models(
-        model_scenes,
+        models=models,
         resume=True,
         latentDim=1
     )
@@ -89,11 +96,11 @@ if __name__ == "__main__":
     # ---------------------------
     # Visualize trained scenes
     # ---------------------------
-    for model_name, scenes in model_scenes.items():
+    for model_name, scenes in models.items():
         print(f"\nVisualizing model: {model_name}")
-        for scene_id in range(len(scenes)):
+        for scene_id in scenes.keys():
             VisualizeAShape.visualize_a_shape(
-                model_name,
+                model_name=model_name,
                 scene_id=scene_id,
                 experiment_root=EXPERIMENT_ROOT
             )
@@ -102,7 +109,7 @@ if __name__ == "__main__":
     # Print latent vectors with associated parameters
     # ---------------------------
     print("\nLatent vectors with parameters for all models and scenes:")
-    for model_name, scenes in model_scenes.items():
+    for model_name, scenes in models.items():
         latent_dir = os.path.join(EXPERIMENT_ROOT, "trained_models", model_name, "LatentCodes")
         latest_file = os.path.join(latent_dir, "latest.pth")
         if not os.path.exists(latest_file):
@@ -115,8 +122,9 @@ if __name__ == "__main__":
         for scene_key in sorted(all_latents.keys()):
             latent_code = all_latents[scene_key]
             idx = int(scene_key.split("_")[-1])
-            params = sdf_parameters[model_name][idx]
-            print(f"Model: {model_name}, Scene: {scene_key}, Parameters: {params}, "
+            params_list = list(scenes["scenes"][idx][1])
+
+            print(f"Model: {model_name}, Scene: {scene_key}, Parameters: {params_list}, "
                   f"Latent vector: {latent_code.numpy().flatten()}")
 
     # ---------------------------
@@ -125,7 +133,7 @@ if __name__ == "__main__":
     print("\nGenerating interpolated latent shapes (-1 → 1)...")
     latent_values = np.linspace(-1, 1, 10)
 
-    for model_name in model_scenes.keys():
+    for model_name in models.keys():
         interp_dir = os.path.join(EXPERIMENT_ROOT, "trained_models", model_name, "InterpolatedShapes")
         os.makedirs(interp_dir, exist_ok=True)
         manifest = {}

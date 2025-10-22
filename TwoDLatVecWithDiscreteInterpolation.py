@@ -21,7 +21,7 @@ def exp_path(*args):
 # Main
 # ====================================================
 if __name__ == "__main__":
-    trainer = Trainer.DeepSDFTrainer(base_dir=exp_path("trained_models"))
+    trainer = Trainer.Trainer(base_dir=exp_path("trained_models"))
 
     radii = [0.1, 0.3, 0.5, 0.7, 0.9]
     torus_radii_ratio = 0.5
@@ -29,30 +29,46 @@ if __name__ == "__main__":
     operator_colors = ["red", "green", "blue", "purple"]
 
     model_name = "Latent2D_AllShapes"
-    model_scenes = []
-    scene_meta = []
 
     # ---------------------------
-    # Build scene list
+    # Build scene list as SDFCallable + param_ranges
     # ---------------------------
+    sdfs = []
+    params_list = []
+
     for shape, op_code in operator_codes.items():
         for R in radii:
             if shape == "Sphere":
-                model_scenes.append(sdf_primitives.SphereSDF(center=[0,0,0], radius=R)._compute)
+                sdfs.append(lambda q, R=R: sdf_primitives.SphereSDF(center=[0,0,0], radius=R)._compute(q[:, :3]))
+                params_list.append({"R": float(R), "operator": float(op_code)})
             elif shape == "CornerSphere":
-                model_scenes.append(sdf_primitives.CornerSpheresSDF(radius=R)._compute)
+                sdfs.append(lambda q, R=R: sdf_primitives.CornerSpheresSDF(radius=R)._compute(q[:, :3]))
+                params_list.append({"R": float(R), "operator": float(op_code)})
             elif shape == "Cylinder":
-                model_scenes.append(sdf_primitives.CylinderSDF(point=[0,0,0], axis="y", radius=R)._compute)
+                sdfs.append(lambda q, R=R: sdf_primitives.CylinderSDF(point=[0,0,0], axis="y", radius=R)._compute(q[:, :3]))
+                params_list.append({"R": float(R), "operator": float(op_code)})
             elif shape == "Torus":
-                r = R * torus_radii_ratio
-                model_scenes.append(sdf_primitives.TorusSDF(center=[0,0,0], R=R, r=r)._compute)
+                r_small = R * torus_radii_ratio
+                sdfs.append(lambda q, R=R, r_small=r_small: sdf_primitives.TorusSDF(center=[0,0,0], R=R, r=r_small)._compute(q[:, :3]))
+                params_list.append({"R": float(R), "r_small": float(r_small), "operator": float(op_code)})
 
-            scene_meta.append({"shape": shape, "operator": op_code, "R": R})
+    # Helper to convert list of SDFs + params -> scene dict
+    def build_scene_dict(sdfs, params):
+        return {i: (sdf, list(p.values())) for i, (sdf, p) in enumerate(zip(sdfs, params))}
+
+    scenes = {"scenes": build_scene_dict(sdfs, params_list)}
+    models: Trainer.Models = {model_name: scenes}
 
     # ---------------------------
     # Train unified model (2D latent)
     # ---------------------------
-    trainer.train_models({model_name: model_scenes}, resume=True, latentDim=2)
+    print(f"[INFO] Training model: {model_name} with {len(sdfs)} total scenes...")
+    trainer.train_models(
+        models=models,
+        latentDim=2,
+        resume=True
+    )
+    print(f"[INFO] Training complete for model '{model_name}'.")
 
     # ---------------------------
     # Load latent codes
@@ -66,11 +82,11 @@ if __name__ == "__main__":
     shapes = []
     radii_vals = []
 
-    for (key, vec), meta in zip(latents.items(), scene_meta):
+    for (key, vec), param in zip(latents.items(), params_list):
         latent_vecs.append(vec.squeeze().numpy())
-        shapes.append(meta["operator"])
-        radii_vals.append(meta["R"])
-        print(f"[INFO] Scene: {key}, Operator: {meta['operator']}, R: {meta['R']}, Latent: {vec.squeeze().numpy()}")
+        shapes.append(param[-1])  # last value = operator code
+        radii_vals.append(param[0])
+        print(f"[INFO] Scene: {key}, Operator: {param[-1]}, R: {param[0]}, Latent: {vec.squeeze().numpy()}")
 
     latent_vecs = torch.tensor(latent_vecs)
     if latent_vecs.shape[1] != 2:
@@ -110,16 +126,13 @@ if __name__ == "__main__":
     except Exception:
         print("[WARN] Could not open interactive window (headless environment).")
 
-    print(f"[INFO] Visualization complete for {model_name}")
-
     # ---------------------------
-    # Interpolate latent vectors (10x10 grid) and save meshes
+    # Interpolate latent vectors (10x10 grid)
     # ---------------------------
     interpolated_dir = os.path.join(trainer.base_dir, model_name, "InterpolatedShapes")
     os.makedirs(interpolated_dir, exist_ok=True)
     manifest = {}
 
-    # Define 10x10 grid bounds
     x_vals = np.linspace(latent_vecs[:,0].min(), latent_vecs[:,0].max(), 10)
     y_vals = np.linspace(latent_vecs[:,1].min(), latent_vecs[:,1].max(), 10)
 
@@ -128,9 +141,7 @@ if __name__ == "__main__":
     for xi in x_vals:
         for yi in y_vals:
             latent_point = torch.tensor([[xi, yi]], dtype=torch.float32)
-            # Human-readable filename
             filename = f"{'+%.3f' % xi}_{'+%.3f' % yi}.ply"
-            mesh_path = os.path.join(interpolated_dir, filename)
             VisualizeAShape.visualize_a_shape(
                 model_name=model_name,
                 latent=latent_point,
@@ -146,3 +157,4 @@ if __name__ == "__main__":
 
     print(f"[INFO] Interpolated meshes saved under: {interpolated_dir}")
     print(f"[INFO] Manifest saved as: {manifest_path}")
+

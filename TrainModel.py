@@ -46,10 +46,12 @@ patch_get_instance_filenames()
 # ------------------------
 
 SDFCallable = Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor]
+Scenes = Dict[str, Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]]
+Models = Dict[str, Scenes]
 def trainModel(
     base_directory: str,
     model_name: str,
-    scenes: Dict[str, Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]],
+    scenes: Scenes,
     resume: bool = True,
     domainRadius: float = 1.0,
     latentDim: int = 1,
