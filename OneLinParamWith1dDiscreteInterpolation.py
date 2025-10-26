@@ -1,10 +1,11 @@
 import os
-import numpy as np
-import Trainer
-import VisualizeAShape
-import DeepSDFStruct.sdf_primitives as sdf_primitives
 import sys
 import json
+import numpy as np
+import torch
+import VisualizeAShape
+import DeepSDFStruct.sdf_primitives as sdf_primitives
+from Model import Model, Scene, SDFCallable, Scenes  # updated classes
 
 # ============================================================
 # Experiment Configuration
@@ -17,6 +18,7 @@ os.makedirs(EXPERIMENT_ROOT, exist_ok=True)
 def exp_path(*args):
     """Prefix paths with the experiment root."""
     return os.path.join(EXPERIMENT_ROOT, *args)
+
 
 # ---------------------------
 # Tee-like logger to capture stdout to a txt file
@@ -34,13 +36,13 @@ class TeeLogger(object):
         self.terminal.flush()
         self.log.flush()
 
-sys.stdout = TeeLogger(os.path.join(EXPERIMENT_ROOT, "results.txt"))
+
+sys.stdout = TeeLogger(exp_path("results.txt"))
 
 # ============================================================
 # Continuous Operator Experiment
 # ============================================================
 if __name__ == "__main__":
-    trainer = Trainer.Trainer(base_dir=exp_path("trained_models"))
     model_name = "AllShapes"
 
     # Radii and torus ratio
@@ -79,21 +81,31 @@ if __name__ == "__main__":
         sdfs.append(lambda q, R=R, r_small=r_small: sdf_primitives.TorusSDF(center=[0,0,0], R=R, r=r_small)._compute(q[:, :3]))
         params.append({"R": float(R), "r_small": float(r_small), "operator": float(operator_codes["Torus"])})
 
-    # Wrap into Scenes dict
-    scenes = {"scenes": build_scene_dict(sdfs, params)}
+    # Scenes dict
+    # Build Scenes dict with proper typing
+    scenes_dict: Scenes = {
+        model_name: {
+            i: (
+                sdf_fn,
+                [(v, v) for v in param_dict.values()]  # convert float values -> List[Tuple[float,float]]
+            )
+            for i, (sdf_fn, param_dict) in enumerate(zip(sdfs, params))
+        }
+    }
 
-    # Wrap into Models dict
-    models: Trainer.Models = {model_name: scenes}
 
     # ---------------------------
-    # Train the unified model
+    # Train unified model using Model class
     # ---------------------------
-    print(f"[INFO] Training model: {model_name} with {len(sdfs)} total scenes...")
-    trainer.train_models(
-        models=models,
-        latentDim=0,  # no latent code
-        resume=True
+    print(f"[INFO] Training model: {model_name} with {len(scenes_dict)} total scenes...")
+    model = Model(
+        base_directory=exp_path("trained_models"),
+        model_name=model_name,
+        scenes=scenes_dict,
+        resume=True,
+        latentDim=0  # no latent code for operator experiments
     )
+    model.trainModel()
     print(f"[INFO] Training complete for model '{model_name}'.")
 
     # ---------------------------
@@ -103,13 +115,14 @@ if __name__ == "__main__":
     operator_values = np.arange(0.0, 4.1, 0.1)
     radius_values = np.linspace(0.1, 0.9, 5)
 
-    interpolated_dir = os.path.join(EXPERIMENT_ROOT, "trained_models", model_name, "InterpolatedShapes")
+    interpolated_dir = exp_path("trained_models", model_name, "InterpolatedShapes")
     os.makedirs(interpolated_dir, exist_ok=True)
     manifest = {}
 
     for r in radius_values:
         for op in operator_values:
-            param_values = [r, float(op)]
+            # Use a dummy latent vector if latentDim>0, else just param values
+            param_values = torch.tensor([[r, float(op)]], dtype=torch.float32)
             suffix = f"r{r:.2f}_op{op:.2f}"
             meshes = VisualizeAShape.visualize_a_shape(
                 model_name=model_name,

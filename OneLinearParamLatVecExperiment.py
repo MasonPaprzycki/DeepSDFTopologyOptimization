@@ -1,12 +1,11 @@
 import os
-import sys
+import json
 import torch
 import numpy as np
-import json
-
+from DeepSDFStruct.sdf_primitives import SphereSDF, CornerSpheresSDF, CylinderSDF, TorusSDF
 import VisualizeAShape
-import DeepSDFStruct.sdf_primitives as sdf_primitives
-import Trainer  # updated wrapper
+from typing import Dict
+from Model import Model, Scene, SDFCallable  # import the class version
 
 # ---------------------------
 # Experiment folder
@@ -17,141 +16,98 @@ os.makedirs(EXPERIMENT_ROOT, exist_ok=True)
 print(f"[DEBUG] EXPERIMENT_ROOT = {EXPERIMENT_ROOT}")
 
 # ---------------------------
-# Tee-like logger to capture stdout
+# Define models and SDFs
 # ---------------------------
-class TeeLogger:
-    def __init__(self, filename):
-        self.terminal = sys.stdout
-        self.log = open(filename, "w", encoding="utf-8")
+models: Dict[str, Dict] = {}
+iterations = 19
+radii = np.linspace(0, 1, iterations + 2)[1:-1].tolist()
+torus_ratio = 0.5
 
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
+def make_sdf_list(sdf_class, param_key, radii, extra_params=None):
+    sdf_list = []
+    param_list = []
+    for r in radii:
+        if extra_params:
+            sdf_fn = lambda q, _: sdf_class(**extra_params(r))._compute(q[:, :3])
+            params = extra_params(r)
+        else:
+            sdf_fn = lambda q, _: sdf_class(**{param_key: r})._compute(q[:, :3])
+            params = {param_key: r}
+        sdf_list.append(sdf_fn)
+        param_list.append(list(params.values()))
+    return sdf_list, param_list
 
-    def flush(self):
-        self.terminal.flush()
-        self.log.flush()
+# Sphere
+sphere_sdfs, sphere_params = make_sdf_list(SphereSDF, "radius", radii)
+models["Sphere"] = {"scenes": {i: (sdf, param) for i, (sdf, param) in enumerate(zip(sphere_sdfs, sphere_params))}}
 
-sys.stdout = TeeLogger(os.path.join(EXPERIMENT_ROOT, "results.txt"))
+# Cylinder
+cylinder_sdfs, cylinder_params = make_sdf_list(CylinderSDF, "radius", radii, lambda r: {"point":[0,0,0], "axis":"y", "radius":r})
+models["Cylinder"] = {"scenes": {i: (sdf, param) for i, (sdf, param) in enumerate(zip(cylinder_sdfs, cylinder_params))}}
+
+# Torus
+def torus_params_fn(R):
+    return {"center": [0,0,0], "R": R, "r": R*torus_ratio}
+torus_sdfs, torus_params = make_sdf_list(TorusSDF, "R", radii, torus_params_fn)
+models["Torus"] = {"scenes": {i: (sdf, param) for i, (sdf, param) in enumerate(zip(torus_sdfs, torus_params))}}
+
+# CornerSphere
+cornersphere_sdfs, cornersphere_params = make_sdf_list(CornerSpheresSDF, "radius", radii)
+models["CornerSphere"] = {"scenes": {i: (sdf, param) for i, (sdf, param) in enumerate(zip(cornersphere_sdfs, cornersphere_params))}}
 
 # ---------------------------
-# Main experiment
+# Train models using the new Model class
 # ---------------------------
-if __name__ == "__main__":
-    trainer = Trainer.Trainer(base_dir=os.path.join(EXPERIMENT_ROOT, "trained_models"))
+trained_models: Dict[str, Model] = {}
 
-    # ---------------------------
-    # Define SDF functions and parameter ranges per model
-    # ---------------------------
-    iterations = 19
-    radii = np.linspace(0, 1, iterations + 2)[1:-1].tolist()
-    torus_ratio = 0.5
-
-    # Models dict
-    models: Trainer.Models = {}
-
-    # Sphere
-    sphere_sdfs = [
-        (lambda r: lambda q, _: sdf_primitives.SphereSDF(center=[0,0,0], radius=r)._compute(q[:, :3]))(r)
-        for r in radii
-    ]
-    sphere_params = [{"radius": (r, r)} for r in radii]
-
-    # Wrap the scene dict under a string key "scenes"
-    models["Sphere"] = {"scenes": {i: (sdf, list(p.values())) for i, (sdf, p) in enumerate(zip(sphere_sdfs, sphere_params))}}
-
-    # Cylinder
-    cylinder_sdfs = [
-        (lambda r: lambda q, _: sdf_primitives.CylinderSDF(point=[0,0,0], axis="y", radius=r)._compute(q[:, :3]))(r)
-        for r in radii
-    ]
-    cylinder_params = [{"radius": (r, r)} for r in radii]
-    models["Cylinder"] = {"scenes": {i: (sdf, list(p.values())) for i, (sdf, p) in enumerate(zip(cylinder_sdfs, cylinder_params))}}
-
-    # Torus
-    torus_sdfs = [
-        (lambda R: lambda q, _: sdf_primitives.TorusSDF(center=[0,0,0], R=R, r=R*torus_ratio)._compute(q[:, :3]))(R)
-        for R in radii
-    ]
-    torus_params = [{"R": (R, R), "r": (R*torus_ratio, R*torus_ratio)} for R in radii]
-    models["Torus"] = {"scenes": {i: (sdf, list(p.values())) for i, (sdf, p) in enumerate(zip(torus_sdfs, torus_params))}}
-
-    # CornerSphere
-    cornersphere_sdfs = [
-        (lambda r: lambda q, _: sdf_primitives.CornerSpheresSDF(radius=r)._compute(q[:, :3]))(r)
-        for r in radii
-    ]
-    cornersphere_params = [{"radius": (r, r)} for r in radii]
-    models["CornerSphere"] = {"scenes": {i: (sdf, list(p.values())) for i, (sdf, p) in enumerate(zip(cornersphere_sdfs, cornersphere_params))}}
-
-    # ---------------------------
-    # Train all models using updated wrapper
-    # ---------------------------
-    trainer.train_models(
-        models=models,
+for model_name, scenes_dict in models.items():
+    print(f"[INFO] Training model: {model_name}")
+    model = Model(
+        base_directory=os.path.join(EXPERIMENT_ROOT, "trained_models"),
+        model_name=model_name,
+        scenes=scenes_dict["scenes"],
         resume=True,
         latentDim=1
     )
+    model.trainModel()
+    trained_models[model_name] = model
 
-    # ---------------------------
-    # Visualize trained scenes
-    # ---------------------------
-    for model_name, scenes in models.items():
-        print(f"\nVisualizing model: {model_name}")
-        for scene_id in scenes.keys():
-            VisualizeAShape.visualize_a_shape(
-                model_name=model_name,
-                scene_id=scene_id,
-                experiment_root=EXPERIMENT_ROOT
-            )
+# ---------------------------
+# Visualize trained scenes
+# ---------------------------
+for model_name, model in trained_models.items():
+    print(f"\nVisualizing model: {model_name}")
+    for scene_key, scene in model.trained_scenes.items():
+        VisualizeAShape.visualize_a_shape(
+            model_name=model_name,
+            scene_id=int(scene_key.split("_")[-1]),
+            experiment_root=EXPERIMENT_ROOT
+        )
 
-    # ---------------------------
-    # Print latent vectors with associated parameters
-    # ---------------------------
-    print("\nLatent vectors with parameters for all models and scenes:")
-    for model_name, scenes in models.items():
-        latent_dir = os.path.join(EXPERIMENT_ROOT, "trained_models", model_name, "LatentCodes")
-        latest_file = os.path.join(latent_dir, "latest.pth")
-        if not os.path.exists(latest_file):
-            print(f"No latest.pth found for {model_name}")
-            continue
+# ---------------------------
+# Interpolate latent vectors (1D)
+# ---------------------------
+print("\nGenerating interpolated latent shapes (-1 → 1)...")
+latent_values = np.linspace(-1, 1, 10)
 
-        latest_data = torch.load(latest_file, map_location="cpu")
-        all_latents = latest_data.get("latent_codes", {})
+for model_name, model in trained_models.items():
+    interp_dir = os.path.join(EXPERIMENT_ROOT, "trained_models", model_name, "InterpolatedShapes")
+    os.makedirs(interp_dir, exist_ok=True)
+    manifest = {}
 
-        for scene_key in sorted(all_latents.keys()):
-            latent_code = all_latents[scene_key]
-            idx = int(scene_key.split("_")[-1])
-            params_list = list(scenes["scenes"][idx][1])
+    for val in latent_values:
+        latent_point = torch.tensor([[val]], dtype=torch.float32)
+        filename = f"{val:+.3f}.ply"
 
-            print(f"Model: {model_name}, Scene: {scene_key}, Parameters: {params_list}, "
-                  f"Latent vector: {latent_code.numpy().flatten()}")
+        VisualizeAShape.visualize_a_shape(
+            model_name=model_name,
+            latent=latent_point,
+            save_suffix=None,
+            experiment_root=EXPERIMENT_ROOT
+        )
+        manifest[filename] = float(val)
 
-    # ---------------------------
-    # Interpolate latent vectors (1D latent from -1 to 1)
-    # ---------------------------
-    print("\nGenerating interpolated latent shapes (-1 → 1)...")
-    latent_values = np.linspace(-1, 1, 10)
+    with open(os.path.join(interp_dir, "latent_1d_manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
 
-    for model_name in models.keys():
-        interp_dir = os.path.join(EXPERIMENT_ROOT, "trained_models", model_name, "InterpolatedShapes")
-        os.makedirs(interp_dir, exist_ok=True)
-        manifest = {}
-
-        for val in latent_values:
-            latent_point = torch.tensor([[val]], dtype=torch.float32)
-            filename = f"{val:+.3f}.ply"
-
-            VisualizeAShape.visualize_a_shape(
-                model_name=model_name,
-                latent=latent_point,
-                save_suffix=None,
-                experiment_root=EXPERIMENT_ROOT
-            )
-            manifest[filename] = float(val)
-
-        # Save JSON manifest
-        with open(os.path.join(interp_dir, "latent_1d_manifest.json"), "w") as f:
-            json.dump(manifest, f, indent=2)
-
-        print(f"[INFO] Interpolated 1D latent meshes saved in: {interp_dir}")
+    print(f"[INFO] Interpolated 1D latent meshes saved in: {interp_dir}")
