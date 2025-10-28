@@ -1,0 +1,10 @@
+{
+  "train": {
+    "model": [
+      "model_torus",
+      "model_sphere",
+      "model_cylinder",
+      "model_corner_sphere"
+    ]
+  }
+}

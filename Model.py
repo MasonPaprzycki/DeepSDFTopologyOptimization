@@ -47,7 +47,6 @@ patch_get_instance_filenames()
 # ------------------------
 SDFCallable = Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor]
 Scenes = Dict[str, Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]]
-Models = Dict[str, Scenes]
 
 class Model: 
     def __init__(
@@ -191,7 +190,10 @@ class Model:
             split_dict = {"train": {}}
         split_dict.setdefault("train", {}).setdefault(self.model_name, [])
         for scene_id in self.scenes.keys():
-            key = f"{self.model_name.lower()}_{scene_id:03d}"
+            #key = f"{self.model_name.lower()}_{scene_id:03d}"
+
+            key = f"{self.model_name.lower()}_{scene_id}"
+
             if key not in split_dict["train"][self.model_name]:
                 split_dict["train"][self.model_name].append(key)
         with open(train_split_path, "w") as f:
@@ -199,8 +201,10 @@ class Model:
 
         # ---------------- Training Loop ----------------
         for scene_idx, (scene_id, sdf_parameters) in enumerate(self.scenes.items()):
-            scene_key = f"{self.model_name.lower()}_{scene_id:03d}"
-            scene_folder = os.path.join(scenes_dir, f"{scene_id:03d}")
+            #scene_key = f"{self.model_name.lower()}_{scene_id:03d}"
+            scene_key = f"{self.model_name.lower()}_{scene_id}"
+
+            scene_folder = os.path.join(scenes_dir, scene_id)
             scene_latent_dir = os.path.join(scene_folder, "LatentCodes")
             os.makedirs(scene_latent_dir, exist_ok=True)
 
@@ -365,9 +369,14 @@ class Model:
             print(f"[INFO] Finished training scene {scene_key} (final epoch {final_epoch})")
 
         for scene_id in self.scenes.keys():
-            scene_key = f"{self.model_name.lower()}_{scene_id:03d}"
-            # Load trained latent vector from your logic
-            latent_trained = torch.zeros(self.latentDim)  # replace with actual loaded latent
+            scene_key = f"{self.model_name.lower()}_{scene_id}"  # match training keys
+            # Load the latent vector from the latest checkpoint
+            if scene_key in top_data["latent_codes"]:
+                latent_trained = top_data["latent_codes"][scene_key]
+            else:
+                # fallback if somehow missing
+                latent_trained = torch.zeros(self.latentDim)
+                print(f"[WARN] Latent code for {scene_key} not found in checkpoint, using zeros.")
             self.trained_scenes[scene_key] = Scene(scene_key, latent_trained, self.domainRadius)
 
     def get_scene(self, scene_key: str) -> "Scene":
