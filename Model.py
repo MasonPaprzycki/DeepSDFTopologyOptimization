@@ -253,6 +253,40 @@ class Model:
 
                 for i, key in enumerate(operator_keys):
                     op_idx = list(sdf_parameters.keys()).index(key)  # find the index in param_ranges_flat
+
+                    #if no parameter ranges for this operator → skip param sampling
+                    if len(param_ranges_flat) == 0:
+                        # sample xyz
+                        xyz = (torch.rand(batch_size, 3, dtype=torch.float32) * 2 - 1) * self.domainRadius
+
+                        # assemble query depending on single vs multi op
+                        if len(operator_keys) > 1:
+                            op_value = torch.full((batch_size, 1), float(i), dtype=torch.float32)
+                            queries_op = torch.cat([xyz, op_value], dim=1)
+                        else:
+                            queries_op = xyz
+
+                        # evaluate SDF
+                        sdf_fn, _ = sdf_parameters[key]
+                        sdf_op_vals = sdf_fn(xyz, None)
+                        if sdf_op_vals.dim() == 1:
+                            sdf_op_vals = sdf_op_vals.unsqueeze(1)
+
+                        data = torch.cat([queries_op, sdf_op_vals], dim=1).numpy()
+                        sdf_col_idx = data.shape[1] - 1
+                        batch_pos = data[np.abs(data[:, sdf_col_idx]) < specs["ClampingDistance"]]
+                        batch_neg = data[np.abs(data[:, sdf_col_idx]) >= specs["ClampingDistance"]]
+
+                        if len(pos_list) < target_pos:
+                            remaining = target_pos - len(pos_list)
+                            pos_list.append(batch_pos[:remaining])
+                        if len(neg_list) < target_neg:
+                            remaining = target_neg - len(neg_list)
+                            neg_list.append(batch_neg[:remaining])
+
+                        continue  #skip the parameter sampling path completely
+
+                    # ---------- normal param case ----------
                     low_vals = torch.tensor([lo for lo, _ in param_ranges_flat[op_idx]], dtype=torch.float32)
                     high_vals = torch.tensor([hi for _, hi in param_ranges_flat[op_idx]], dtype=torch.float32)
 
@@ -279,23 +313,18 @@ class Model:
                         if sdf_op_vals.dim() == 1:
                             sdf_op_vals = sdf_op_vals.unsqueeze(1)
 
-                        # clamp SDF values ensures that we do not oversample far away points
-                        # this is best for training since the goal is to interpolate between shapes 
-                        # and shapes are encoded implicitly by the zero level set
-                        # thus points far away from the surface are not very useful
-
                         data = torch.cat([queries_op, sdf_op_vals], dim=1).numpy()
                         sdf_col_idx = data.shape[1] - 1
                         batch_pos = data[np.abs(data[:, sdf_col_idx]) < specs["ClampingDistance"]]
                         batch_neg = data[np.abs(data[:, sdf_col_idx]) >= specs["ClampingDistance"]]
 
-                        # append only up to target
                         if len(pos_list) < target_pos:
                             remaining = target_pos - len(pos_list)
                             pos_list.append(batch_pos[:remaining])
                         if len(neg_list) < target_neg:
                             remaining = target_neg - len(neg_list)
                             neg_list.append(batch_neg[:remaining])
+
 
                 # ---------------- Combine all batches ----------------
                 pos = np.vstack(pos_list) if pos_list else np.empty((0, batch_size), dtype=np.float32)
