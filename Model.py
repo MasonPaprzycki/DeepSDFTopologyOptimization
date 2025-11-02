@@ -7,18 +7,29 @@ import numpy as np
 import DeepSDFStruct.deep_sdf.data as deep_data
 import DeepSDFStruct.deep_sdf.training as training
 from VisualizeAShape import visualize_a_shape
+import os
+import torch
+import multiprocessing
+import warnings
 
 # ------------------------
 # Limit CPU threads globally
-# unique to the  machine. Adjust number of CPU cores as needed
-# Additionally deeoSDFStruct supports NVDIA GPU acceleration
+# unique to the  machine. 
+# Additionally deepSDFStruct and the original deepSDF support NVDIA GPU acceleration
+# this has not been implemented in the script but would be useful
 # ------------------------
+NUM_CORES = multiprocessing.cpu_count()
 
-NUM_CORES = 16
+# Set environment variables for parallel libraries
 os.environ["OMP_NUM_THREADS"] = str(NUM_CORES)
 os.environ["MKL_NUM_THREADS"] = str(NUM_CORES)
+
+# Configure PyTorch threading
 torch.set_num_threads(NUM_CORES)
 torch.set_num_interop_threads(min(4, NUM_CORES // 2))
+
+print(f"Configured PyTorch to use {NUM_CORES} CPU cores.")
+
 
 # ------------------------
 # Patch DeepSDF loader for flat SdfSamples
@@ -36,7 +47,6 @@ def patch_get_instance_filenames():
 patch_get_instance_filenames()
 
 # ------------------------
-#
 # Caution! 
 # Upon resuming training this script generates log.pth files to satisfy DeepSDF's API. 
 #
@@ -46,7 +56,8 @@ patch_get_instance_filenames()
 # minor modifications however. 
 # ------------------------
 SDFCallable = Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor]
-Scenes = Dict[str, Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]]
+SceneWithOperators = Dict[int, Tuple[SDFCallable, List[Tuple[float, float]]]]
+Scenes = Dict[str, SceneWithOperators]
 
 class Model: 
     def __init__(
@@ -82,12 +93,10 @@ class Model:
 
         # ------------- derive global param space from scenes -------------
         global_add_param_ranges = []
-        scene_names = list(self.scenes.keys())
         global_add_num_params = []
 
-        for scene in self.scenes.values():
+        for scene_name, scene in self.scenes.items():
             scene_param_ranges = []
-            i =0
             for op_params in scene.values():
                 if isinstance(op_params, (list, tuple)):
                     for rng in op_params:
@@ -95,16 +104,18 @@ class Model:
                             lo, hi = rng
                             if hi >= lo:
                                 scene_param_ranges.append((lo, hi))
-                i+=1
+                            else: 
+                                scene_param_ranges.append ((hi,lo))
+            
             scene_add_n_params = len(scene_param_ranges)/len(scene.values())
             if scene_add_n_params != int(scene_add_n_params):
-                raise ValueError("Inconsistent number of parameters across operators in scene" + scene_names[i])
+                raise ValueError("Inconsistent number of parameters across operators in scene" + scene_name)
             
             if len(scene.values()) >1: scene_add_n_params +=1 
 
             for i in range(0,len(scene_param_ranges)-1):
                 if (scene_param_ranges[i] != scene_param_ranges[i+1]):
-                    raise Warning(f"Inconsistent range of parameters between operators : {i} and {i+1} probably not the best for training")
+                    warnings.warn(f"Inconsistent range of parameters between operators : {i} and {i+1} probably not the best for training")
                 
             global_add_param_ranges.append(scene_param_ranges)
             global_add_num_params.append(int(scene_add_n_params))
@@ -114,28 +125,42 @@ class Model:
                 raise ValueError(f"Inconsistent number of parameters between scenes : {list(self.scenes.keys())[i]} and {list(self.scenes.keys())[i+1]} probably not the best for training")
             
             if (global_add_param_ranges[i] != global_add_param_ranges[i+1]):
-                raise ValueError(f"Inconsistent range of parameters between scenes : {list(self.scenes.keys())[i]} and {list(self.scenes.keys())[i+1]} probably not the best for training")
+                warnings.warn(f"Inconsistent range of parameters between scenes :  {list(self.scenes.keys())[i]} and {list(self.scenes.keys())[i+1]} probably not the best for training")
         
         geom_n_params = global_add_num_params[0] +3 # all scenes must have same number of params
 
-        
-        
-        # ---------------- Folder setup ----------------
-        root = os.path.abspath(os.path.join(self.base_directory, self.model_name))  # absolute path
-        split_dir = os.path.abspath(os.path.join(root, "split"))
-        model_params_dir = os.path.abspath(os.path.join(root, "ModelParameters"))
-        scenes_dir = os.path.abspath(os.path.join(root, "Scenes"))
-        samples_dir = os.path.abspath(os.path.join(root, "SdfSamples"))
-        top_latent_dir = os.path.abspath(os.path.join(root, "LatentCodes"))
+        # Define subdirectories consistently
+        split_dir = os.path.join(self.base_directory, "split")
+        model_params_dir = os.path.join(self.base_directory, "ModelParameters")
+        scenes_dir = os.path.join(self.base_directory, "Scenes")
+        samples_dir = os.path.join(self.base_directory, "SdfSamples")
+        top_latent_dir = os.path.join(self.base_directory, "LatentCodes")
 
-        for d in [root, split_dir, model_params_dir, scenes_dir, samples_dir, top_latent_dir]:
+        # Create them if needed
+        for d in [self.base_directory, split_dir, model_params_dir, scenes_dir, samples_dir, top_latent_dir]:
             os.makedirs(d, exist_ok=True)
-
-        print(f"[DEBUG] Using experiment directory: {root}")
+        
+    
+        print(f"[DEBUG] Using experiment directory: {self.base_directory}")
         print(f"[DEBUG] Latent code directory: {top_latent_dir}")
 
+        # ---------------- Load latest top-level latent codes for resume ----------------
+        existing_ckpts = [
+            f for f in os.listdir(top_latent_dir) if f.endswith(".pth") and f[:-4].isdigit()
+        ]
+        latest_epoch = max([int(f[:-4]) for f in existing_ckpts], default=0)
+
+        top_data = {"latent_codes": {}}
+        if existing_ckpts:
+            top_ckpt_file = os.path.join(top_latent_dir, f"{latest_epoch}.pth")
+            top_data = torch.load(top_ckpt_file, map_location="cpu")
+            print(f"[DEBUG] Loaded top-level latent codes from {top_ckpt_file}, epoch {latest_epoch}")
+        else:
+            print(f"[DEBUG] No top-level latent codes found, starting fresh.")
+
+
         # ---------------- Specs ----------------
-        specs_path = os.path.join(root, "specs.json")
+        specs_path = os.path.join(self.base_directory, "specs.json")
         if os.path.exists(specs_path):
             with open(specs_path) as f:
                 specs = json.load(f)
@@ -143,8 +168,8 @@ class Model:
             specs = {
                 "Description": f"Train DeepSDF on analytic {self.model_name} shapes.",
                 "NetworkArch": "deep_sdf_decoder",
-                "DataSource": root,
-                "TrainSplit": "split/TrainSplit.json",
+                "DataSource": self.base_directory,
+                "TrainSplit": os.path.join(self.base_directory, "split", "TrainSplit.json"),
                 "NetworkSpecs": {
                     "dims": [128]*6,
                     "dropout": list(range(6)),
@@ -199,43 +224,15 @@ class Model:
         with open(train_split_path, "w") as f:
             json.dump(split_dict, f, indent=2)
 
-        # ---------------- Training Loop ----------------
-        for scene_idx, (scene_id, sdf_parameters) in enumerate(self.scenes.items()):
-            #scene_key = f"{self.model_name.lower()}_{scene_id:03d}"
+        for scene_idx, (scene_id, scene_with_operators) in enumerate(self.scenes.items()):
             scene_key = f"{self.model_name.lower()}_{scene_id}"
 
-            scene_folder = os.path.join(scenes_dir, scene_id)
-            scene_latent_dir = os.path.join(scene_folder, "LatentCodes")
-            os.makedirs(scene_latent_dir, exist_ok=True)
-
-            # ---------------- Resume logic: find highest checkpoint ----------------
-            existing_ckpts = [
-                f for f in os.listdir(top_latent_dir)
-                if f.endswith(".pth") and f[:-4].isdigit()
-            ]
-            latest_epoch = max([int(f[:-4]) for f in existing_ckpts], default=0)
-
-            if self.resume and latest_epoch >= specs["NumEpochs"]:
-                print(f"[INFO] Scene {scene_key} already fully trained (epoch {latest_epoch}), skipping...")
-                continue
-
-            resume_ckpt = None
-            if self.resume and latest_epoch > 0:
-                resume_ckpt = str(latest_epoch)
-                print(f"[INFO] Resuming {self.model_name} at epoch {latest_epoch}")
-
-                latent_path = os.path.join(top_latent_dir, f"{resume_ckpt}.pth")
-                print(f"[DEBUG] Expecting latent file at: {os.path.abspath(latent_path)}")
-                print(f"[DEBUG] Exists: {os.path.exists(latent_path)}")
-            else:
-                print(f"[INFO] Starting fresh training for {self.model_name}")
-
-            # --- SDF Samples (fixed) ---
+            # --- SDF Samples---
             samples_file = os.path.join(samples_dir, f"{scene_key}.npz")
             if not os.path.exists(samples_file):
 
                 # ---------------- Operator setup ----------------
-                operator_keys = list(sdf_parameters.keys())
+                operator_keys = list(scene_with_operators.keys())
                 random.shuffle(operator_keys)  # shuffle operators
                 n_ops = len(operator_keys)
 
@@ -252,7 +249,7 @@ class Model:
                 max_attempts = 100  # safety to avoid infinite loops
 
                 for i, key in enumerate(operator_keys):
-                    op_idx = list(sdf_parameters.keys()).index(key)  # find the index in param_ranges_flat
+                    op_idx = list(scene_with_operators.keys()).index(key)  # find the index in param_ranges_flat
 
                     #if no parameter ranges for this operator → skip param sampling
                     if len(param_ranges_flat) == 0:
@@ -267,7 +264,7 @@ class Model:
                             queries_op = xyz
 
                         # evaluate SDF
-                        sdf_fn, _ = sdf_parameters[key]
+                        sdf_fn, _ = scene_with_operators[key]
                         sdf_op_vals = sdf_fn(xyz, None)
                         if sdf_op_vals.dim() == 1:
                             sdf_op_vals = sdf_op_vals.unsqueeze(1)
@@ -308,7 +305,7 @@ class Model:
                         queries_op = torch.cat([xyz, op_value, sampled_params], dim=1)
 
                         # evaluate SDF
-                        sdf_fn, _ = sdf_parameters[key]
+                        sdf_fn, _ = scene_with_operators[key]
                         sdf_op_vals = sdf_fn(xyz, sampled_params)
                         if sdf_op_vals.dim() == 1:
                             sdf_op_vals = sdf_op_vals.unsqueeze(1)
@@ -325,117 +322,170 @@ class Model:
                             remaining = target_neg - len(neg_list)
                             neg_list.append(batch_neg[:remaining])
 
-
                 # ---------------- Combine all batches ----------------
                 pos = np.vstack(pos_list) if pos_list else np.empty((0, batch_size), dtype=np.float32)
                 neg = np.vstack(neg_list) if neg_list else np.empty((0, batch_size), dtype=np.float32)
 
-                # Determine if all scenes have exactly one operator
+                ## Determine if all scenes have exactly one operator
                 all_scenes_single_operator = all(len(scene) == 1 for scene in self.scenes.values())
 
-                # ... inside your sampling loop, replace the previous trimming block with:
+                # BEFORE saving - ensure we keep the sdf column (last column)
                 if all_scenes_single_operator:
-                    pos = np.concatenate([pos[:, :3], pos[:, 4:]], axis=1)
-                    neg = np.concatenate([neg[:, :3], neg[:, 4:]], axis=1)
+                    # pos/neg may have several forms:
+                    # - [x,y,z,sdf]                 -> shape[1] == 4  (leave as-is)
+                    # - [x,y,z,op_code,params...,sdf] -> shape[1] >= 5 (drop op_code at index 3)
+                    # - if somehow other shapes appear, print shapes for debugging
+                    if pos.size > 0:
+                        if pos.shape[1] >= 5:
+                            # drop only the op_code (index 3)
+                            pos = np.concatenate([pos[:, :3], pos[:, 4:]], axis=1)
+                        elif pos.shape[1] == 4:
+                            # already [x,y,z,sdf] -> keep as-is
+                            pass
+                        else:
+                            print(f"[WARN] Unexpected pos shape before saving: {pos.shape}")
+                    if neg.size > 0:
+                        if neg.shape[1] >= 5:
+                            neg = np.concatenate([neg[:, :3], neg[:, 4:]], axis=1)
+                        elif neg.shape[1] == 4:
+                            pass
+                        else:
+                            print(f"[WARN] Unexpected neg shape before saving: {neg.shape}")
 
                 # ---------------- Save ----------------
                 np.savez_compressed(samples_file, pos=pos, neg=neg)
 
-            # ---------------- Train ----------------
-            old_cwd = os.getcwd()
-            os.chdir(root)
-            try:
-                print(f"[DEBUG] Changed directory to: {os.getcwd()}")
+        # ---------------- Training Loop ----------------
+        for scene_idx, (scene_id, scene_with_operators) in enumerate(self.scenes.items()):
+            scene_key = f"{self.model_name.lower()}_{scene_id}"
+            scene_folder = os.path.join(scenes_dir, scene_id)
+            scene_latent_dir = os.path.join(scene_folder, "LatentCodes")
+            os.makedirs(scene_latent_dir, exist_ok=True)
 
-                logs_file = os.path.join(root, "Logs.pth")
-                if not os.path.exists(logs_file):
-                    print(f"[WARN] Logs.pth not found — creating a minimal log so training can resume.")
-                    torch.save(
-                        {
-                            "loss": [0.0],              # at least 1 element
-                            "learning_rate": [0.001],   # at least 1 element
-                            "timing": [0.0],
-                            "latent_magnitude": [0.0],
-                            "param_magnitude": {"dummy": [0.0]},
-                            "epoch": [0],               # 0 is fine for start
-                        },
-                        logs_file,
-                    )
 
-                # --- Run training (resume if resume_ckpt is valid) ---
-                training.train_deep_sdf(
-                    experiment_directory=root,
-                    data_source=root,
-                    continue_from=resume_ckpt,
-                    batch_split=1
-                )
-
-            finally:
-                os.chdir(old_cwd)
-                print(f"[DEBUG] Restored directory to: {os.getcwd()}")
-
-            # ---------------- Find latest (highest) checkpoint after training ----------------
-            post_ckpts = [
+            # ---------------- Check per-scene latent snapshots ----------------
+            existing_scene_ckpts = [
+                f for f in os.listdir(scene_latent_dir) if f.endswith(".pth") and f[:-4].isdigit()
+            ]
+            if existing_scene_ckpts:
+                continue
+            
+            # ---------------- Find latest latent checkpoint ----------------
+            existing_model_ckpts = [
+                f for f in os.listdir(model_params_dir)
+                if f.endswith(".pth") and f[:-4].isdigit()
+            ]
+            existing_latent_ckpts = [
                 f for f in os.listdir(top_latent_dir)
                 if f.endswith(".pth") and f[:-4].isdigit()
             ]
-            if not post_ckpts:
-                raise RuntimeError(f"No checkpoints found in {top_latent_dir} after training.")
-            final_epoch = max(int(f[:-4]) for f in post_ckpts)
 
-            # ---------------- Extract trained latent vector ----------------
-            final_ckpt_file = os.path.join(top_latent_dir, f"{final_epoch}.pth")
-            top_data = torch.load(final_ckpt_file, map_location="cpu")
-            latent_trained = top_data["latent_codes"][scene_key]
+            if existing_model_ckpts!= existing_latent_ckpts:
+                raise RuntimeError("Mismatch between latent and model checkpoints")
 
-            # ---------------- Save per-scene snapshots of epochs ----------------
-            final_scene_file = os.path.join(scene_latent_dir, f"{final_epoch}.pth")
-            torch.save(
-                {"latent_codes": {scene_key: latent_trained}, "epochs": {scene_key: final_epoch}},
-                final_scene_file
-            )
-
-            print(f"[INFO] Finished training scene {scene_key} (final epoch {final_epoch})")
-
-        for scene_id in self.scenes.keys():
-            scene_key = f"{self.model_name.lower()}_{scene_id}"  # match training keys
-            # Load the latent vector from the latest checkpoint
-            if scene_key in top_data["latent_codes"]:
-                latent_trained = top_data["latent_codes"][scene_key]
+            elif existing_model_ckpts:
+                resume_ckpt = f"{latest_epoch}"
+                print(f"[INFO] Resuming from epoch {latest_epoch}")
             else:
-                # fallback if somehow missing
-                latent_trained = torch.zeros(self.latentDim)
-                print(f"[WARN] Latent code for {scene_key} not found in checkpoint, using zeros.")
-            self.trained_scenes[scene_key] = Scene(scene_key, latent_trained, self.domainRadius)
+                resume_ckpt = None
+                print("[INFO] Starting from scratch")
+
+
+            # ---------------- Train ----------------
+            old_cwd = os.getcwd()
+            os.chdir(self.base_directory)
+            try:
+                logs_file = os.path.join(self.base_directory, "Logs.pth")
+                if os.path.exists(logs_file):
+                    logs_data = torch.load(logs_file)
+                    # update epoch to last checkpoint (or 0 if fresh)
+                    logs_data["epoch"] = [latest_epoch]
+                    torch.save(logs_data, logs_file)
+                else:
+                    # Create minimal log if none exists
+                    torch.save({
+                        "loss": [0.0],
+                        "learning_rate": [0.001],
+                        "timing": [0.0],
+                        "latent_magnitude": [0.0],
+                        "param_magnitude": {"dummy": [0.0]},
+                        "epoch": [latest_epoch],
+                    }, logs_file)
+
+                training.train_deep_sdf(
+                    experiment_directory=self.base_directory,
+                    data_source=self.base_directory,
+                    continue_from=resume_ckpt,
+                    batch_split=1
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            # ---------------- Load final latent code for this scene ----------------
+            post_ckpts = [
+                f for f in os.listdir(scene_latent_dir) if f.endswith(".pth") and f[:-4].isdigit()
+            ]
+            if not post_ckpts:
+                raise RuntimeError(f"No checkpoints found in {scene_latent_dir} after training.")
+            final_epoch = max(int(f[:-4]) for f in post_ckpts)
+            final_ckpt_file = os.path.join(scene_latent_dir, f"{final_epoch}.pth")
+
+            self.trained_scenes[scene_key] = Scene(
+                parent_model=self,
+                scene_key=scene_key,
+                latent_vector=torch.load(final_ckpt_file,map_location="cpu")
+            )
 
     def get_scene(self, scene_key: str) -> "Scene":
         """Return a Scene instance by key."""
         return self.trained_scenes[scene_key]
     
-class Scene(Model):
-        def __init__(self, scene_key: str, latent_vector: torch.Tensor, domainRadius: float):
-            self.scene_key = scene_key
-            self.latent_vector = latent_vector
-            self.domainRadius = domainRadius
-            # SDF function will be set after training, e.g., from DeepSDF model
-            self.sdf_fn: SDFCallable | None = None
+class Scene():
+    def __init__(self, parent_model: Model, scene_key: str, latent_vector: torch.Tensor):
+        # Call the parent constructor to inherit model attributes
+        self.parent_model = parent_model
+        self.scene_key = scene_key
+        self.latent_vector = latent_vector
+        # Derive the raw scene id (everything after first underscore)
+        raw_id = "_".join(scene_key.split("_")[1:])
 
-        def set_sdf_fn(self, sdf_fn: SDFCallable):
-            """Assign the trained SDF function for this scene."""
-            self.sdf_fn = sdf_fn
+        # Pull the operator dict from the parent model
+        self.sdf_ops = self.parent_model.scenes.get(raw_id)
+        if self.sdf_ops is None:
+            raise KeyError(f"Scene id '{raw_id}' not found in parent model.scenes")
 
-        def compute_sdf(self, xyz: torch.Tensor, params: torch.Tensor | None = None) -> torch.Tensor:
-            """Compute SDF values using the trained function and latent vector."""
-            if self.sdf_fn is None:
-                raise ValueError(f"SDF function not set for scene {self.scene_key}")
-            # Call the SDF function using xyz + latent code + params
-            return self.sdf_fn(xyz, params)
+    def compute_sdf(self, xyz: torch.Tensor, params: torch.Tensor | None = None, operator: int = 0) -> torch.Tensor:
+        """Compute SDF values for this scene using a given operator and optional parameters."""
+            
+        if self.sdf_ops is None:
+            raise ValueError(f"No SDF operators defined for scene '{self.scene_key}'")
+
+        # Lookup operator
+        op_entry = self.sdf_ops.get(operator)
+        if op_entry is None:
+            raise KeyError(f"Operator index {operator} not found in scene '{self.scene_key}'")
+
+        sdf_fn, _ = op_entry  # unpack (function, param_ranges)
+
+        # Call the function with xyz and params
+        try:
+            sdf_vals = sdf_fn(xyz, params)
+        except Exception as e:
+            raise RuntimeError(f"Error evaluating SDF for scene '{self.scene_key}', operator {operator}: {e}")
+
+        # Make sure output is the right shape
+        if sdf_vals.dim() == 1:
+            sdf_vals = sdf_vals.unsqueeze(1)
+
+        return sdf_vals
+            
+        #(xyz, params)
         
-        def get_latent_vector(self) -> torch.Tensor:
-            """Return the latent vector for this scene."""
-            return self.latent_vector
+    def get_latent_vector(self) -> torch.Tensor:
+        """Return the latent vector for this scene."""
+        return self.latent_vector
         
-        def visualize(
+    def visualize(
         self,
         grid_res: int = 128,
         clamp_dist: float = 0.1,
@@ -443,30 +493,30 @@ class Scene(Model):
         save_suffix: str | None = None,
         experiment_root: str | None = None,
         ):
-            """
-            Visualize this scene using the trained latent vector.
+        """
+        Visualize this scene using the trained latent vector.
 
-            Args:
-                grid_res (int): Grid resolution.
-                clamp_dist (float): Clamp distance for SDF values.
-                param_values (list of list, optional): Parameter vectors to visualize.
-                save_suffix (str, optional): Suffix for saved mesh files.
-                experiment_root (str, optional): Root directory for experiments.
+        Args:
+            grid_res (int): Grid resolution.
+            clamp_dist (float): Clamp distance for SDF values.
+            param_values (list of list, optional): Parameter vectors to visualize.
+            save_suffix (str, optional): Suffix for saved mesh files.
+            experiment_root (str, optional): Root directory for experiments.
 
-            Returns:
-                List[trimesh.Trimesh]: Generated meshes.
-            """
-            # Extract scene_id from the scene_key assuming format: "modelname_###"
-            scene_id_str = self.scene_key.split("_")[-1]
-            scene_id = int(scene_id_str)
+        Returns:
+            List[trimesh.Trimesh]: Generated meshes.
+        """
+        # Extract scene_id from the scene_key assuming format: "modelname_###"
+        scene_id_str = self.scene_key.split("_")[-1]
+        scene_id = int(scene_id_str)
 
-            return visualize_a_shape(
-                model_name=self.model_name,
-                scene_id=scene_id,
-                grid_res=grid_res,
-                clamp_dist=clamp_dist,
-                param_values=param_values,
-                latent=self.latent_vector,
-                save_suffix=save_suffix,
-                experiment_root=experiment_root,
-            )
+        return visualize_a_shape(
+            model_name=self.parent_model.model_name,
+            scene_id=scene_id,
+            grid_res=grid_res,
+            clamp_dist=clamp_dist,
+            param_values=param_values,
+            latent=self.latent_vector,
+            save_suffix=save_suffix,
+            experiment_root=experiment_root,
+        )
