@@ -158,7 +158,6 @@ class Model:
         # Create them if needed
         for d in [self.base_directory, split_dir, model_params_dir, scenes_dir, samples_dir, top_latent_dir]:
             os.makedirs(d, exist_ok=True)
-        
     
         print(f"[DEBUG] Using experiment directory: {self.base_directory}")
         print(f"[DEBUG] Latent code directory: {top_latent_dir}")
