@@ -6,6 +6,7 @@ import torch
 import numpy as np
 import DeepSDFStruct.deep_sdf.data as deep_data
 import DeepSDFStruct.deep_sdf.training as training
+
 from VisualizeAShape import visualize_a_shape
 import multiprocessing
 import warnings
@@ -93,6 +94,9 @@ class Model:
         self.FORCE_ONLY_FINAL_SNAPSHOT = FORCE_ONLY_FINAL_SNAPSHOT
         self.trained_scenes: Dict[str,Scene] = {}
 
+    from DeepSDFStruct.deep_sdf.networks.deep_sdf_decoder import DeepSDFDecoder
+
+    
 
     def trainModel(self
     ):
@@ -173,7 +177,6 @@ class Model:
         else:
             print(f"[DEBUG] No top-level latent codes found, starting fresh.")
 
-
         # ---------------- Specs ----------------
         specs_path = os.path.join(self.base_directory, "specs.json")
         if os.path.exists(specs_path):
@@ -198,7 +201,7 @@ class Model:
                     "geom_dimension": geom_n_params
                 },
                 "CodeLength": self.latentDim,
-                "NumEpochs": 500,
+                "NumEpochs": 5,
                 "SnapshotFrequency": 1,
                 "AdditionalSnapshots": [1, 5],
                 "LearningRateSchedule": [
@@ -439,30 +442,91 @@ class Model:
 
             # ---------------- Load final top-level latent dict ----------------
             post_ckpts = [
-                f for f in os.listdir(top_latent_dir) if f.endswith(".pth") and f[:-4].isdigit()
+                f for f in os.listdir(top_latent_dir)
+                if f.endswith(".pth") and f[:-4].isdigit()
             ]
+            if not post_ckpts:
+                raise RuntimeError(f"No latent checkpoints found in {top_latent_dir}")
+
             final_epoch = max(int(f[:-4]) for f in post_ckpts)
-            latent = torch.load(os.path.join(top_latent_dir, f"{final_epoch}.pth"), map_location="cpu")
-            
-            if((scene_idx + 1)<len(self.scenes.keys())):
-                next_scene_id = list(self.scenes.keys())[scene_idx+1]
+            top_latent_path = os.path.join(top_latent_dir, f"{final_epoch}.pth")
+
+            latent = torch.load(top_latent_path, map_location="cpu")
+            if "latent_codes" not in latent or "weight" not in latent["latent_codes"]:
+                raise ValueError(
+                    f"Invalid latent checkpoint format at {top_latent_path}. "
+                    f"Expected 'latent_codes[\"weight\"]'. Keys found: {latent.keys()}"
+                )
+
+            latent_weight = latent["latent_codes"]["weight"]
+
+            # ---------------- Sanity check latent count ----------------
+            expected_latents = scene_idx + 1
+            if latent_weight.shape[0] > expected_latents:
+                print(f"[WARN] Truncating latent matrix: {latent_weight.shape[0]} → {expected_latents}")
+                latent_weight = latent_weight[:expected_latents]
+            elif latent_weight.shape[0] < expected_latents:
                 sigma = 1.0 / math.sqrt(self.latentDim)
-                latent["latent_codes"][next_scene_id] = torch.normal(0.0, sigma, size=(self.latentDim,))
+                extra = torch.normal(0.0, sigma, size=(expected_latents - latent_weight.shape[0], self.latentDim))
+                latent_weight = torch.cat([latent_weight, extra], dim=0)
+                print(f"[INFO] Expanded latent matrix to {expected_latents} entries")
+
+            # ---------------- Append latent for next scene (if any) ----------------
+            if (scene_idx + 1) < len(self.scenes.keys()):
+                sigma = 1.0 / math.sqrt(self.latentDim)
+                new_latent = torch.normal(0.0, sigma, size=(1, self.latentDim))
+                latent_weight = torch.cat([latent_weight, new_latent], dim=0)
+                print(f"[INFO] Added latent vector for next scene index {scene_idx + 1}")
+
+            # ---------------- Pad latent matrix to match TrainSplit (DeepSDF expectation) ----------------
+            train_split_path = os.path.join(self.base_directory, "split", "TrainSplit.json")
+            if os.path.exists(train_split_path):
+                with open(train_split_path, "r") as f:
+                    split = json.load(f)
+                train_scene_count = len(split["train"].get(self.model_name, []))
+                if train_scene_count > 0 and latent_weight.shape[0] != train_scene_count:
+                    print(f"[WARN] Adjusting latent matrix to match TrainSplit: "
+                        f"{latent_weight.shape[0]} → {train_scene_count}")
+                    sigma = 1.0 / math.sqrt(self.latentDim)
+                    if latent_weight.shape[0] < train_scene_count:
+                        pad = torch.normal(0.0, sigma, size=(train_scene_count - latent_weight.shape[0], self.latentDim))
+                        latent_weight = torch.cat([latent_weight, pad], dim=0)
+                    else:
+                        latent_weight = latent_weight[:train_scene_count]
+
+            # ---------------- Update latent structure ----------------
+            latent = {
+                "latent_codes": {"weight": latent_weight},
+                "epoch": 0 
+            }
+
 
             # ---------------- Save per-scene latent ----------------
-            scene_ckpt_file = os.path.join(scene_latent_dir,  f"{final_epoch}.pth")
+            scene_ckpt_file = os.path.join(scene_latent_dir, f"{final_epoch}.pth")
             torch.save(latent, scene_ckpt_file)
-            print(f"[INFO] Saved per-scene latent for '{scene_id}' to {scene_ckpt_file}")
+            print(f"[INFO] Saved per-scene latent for '{scene_id}' → {scene_ckpt_file}")
 
-            # ---------------- Reset model parameters ----------------
-            model_params = torch.load(os.path.join(model_params_dir, f"{final_epoch}.pth"), map_location="cpu")
+            # ---------------- Reset parameters ----------------
+            optimizer_params_path = os.path.join(optimizer_params_dir, f"{final_epoch}.pth")
+            optimizer_params = torch.load(optimizer_params_path,map_location="cpu" )
+            new_optimizer_params_path = os.path.join(optimizer_params_dir, "0.pth")
+
+            model_params_path = os.path.join(model_params_dir, f"{final_epoch}.pth")
+            model_params = torch.load(model_params_path, map_location="cpu")
             new_model_params_ckpt_file = os.path.join(model_params_dir, "0.pth")
 
-            # Clear directories for a clean start
+            # Reset any internal epoch counters if present
+            if "epoch" in optimizer_params:
+                optimizer_params["epoch"] = 0
+            if "epoch" in model_params:
+                model_params["epoch"] = 0
+
+            # Clean directories for next run
             safe_clean_directory(top_latent_dir)
             safe_clean_directory(model_params_dir)
-            safe_clean_directory(optimizer_params_dir)  # optimizer will re-init automatically
+            safe_clean_directory(optimizer_params_dir)  
 
+            torch.save (optimizer_params,new_optimizer_params_path )
             # Save reset model parameters
             torch.save(model_params, new_model_params_ckpt_file)
             print(f"[INFO] Reset model parameters saved to {new_model_params_ckpt_file}")
@@ -470,15 +534,15 @@ class Model:
             # ---------------- Save updated top-level latent dict ----------------
             top_ckpt_file = os.path.join(top_latent_dir, "0.pth")
             torch.save(latent, top_ckpt_file)
-            print(f"[INFO] Updated top-level latent dictionary (including all previous scenes) saved to {top_ckpt_file}")
+            print(f"[INFO] Updated top-level latent dictionary saved to {top_ckpt_file}")
 
-            # ---------------- Register scene ----------------
+            # ---------------- Retrieve current scene latent ----------------
+            latent_vector = latent_weight[scene_idx]
             self.trained_scenes[scene_key] = Scene(
                 parent_model=self,
                 scene_key=scene_key,
-                latent_vector=latent["latent_codes"][scene_id]  # only this scene's vector
+                latent_vector=latent_vector  # only this scene's vector
             )
-
 
     def get_scene(self, scene_key: str) -> "Scene":
         """Return a Scene instance by key."""
