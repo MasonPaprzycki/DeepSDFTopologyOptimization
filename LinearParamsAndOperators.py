@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from VisualizeAShape import visualize_a_shape
 import DeepSDFStruct.sdf_primitives as sdf_primitives
-from Model import Model, Scenes  # your unified classes
+from IterativeModel import Model, Scenes  # your unified classes
 
 # ============================================================
 # Experiment Configuration

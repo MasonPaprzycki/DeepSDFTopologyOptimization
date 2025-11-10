@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import VisualizeAShape
 import DeepSDFStruct.sdf_primitives as sdf_primitives
-from Model import Model, Scenes  # updated classes
+from IterativeModel import Model, Scenes  # updated classes
 
 # ============================================================
 # Experiment Configuration

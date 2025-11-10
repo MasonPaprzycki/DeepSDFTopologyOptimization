@@ -1,0 +1,22 @@
+{
+  "train": {
+    "IterativeLatent2DRadiusSweep": [
+      "iterativelatent2dradiussweep_sphere_0.2",
+      "iterativelatent2dradiussweep_cylinder_0.2",
+      "iterativelatent2dradiussweep_torus_0.2",
+      "iterativelatent2dradiussweep_corner_sphere_0.2",
+      "iterativelatent2dradiussweep_sphere_0.4",
+      "iterativelatent2dradiussweep_cylinder_0.4",
+      "iterativelatent2dradiussweep_torus_0.4",
+      "iterativelatent2dradiussweep_corner_sphere_0.4",
+      "iterativelatent2dradiussweep_sphere_0.6",
+      "iterativelatent2dradiussweep_cylinder_0.6",
+      "iterativelatent2dradiussweep_torus_0.6",
+      "iterativelatent2dradiussweep_corner_sphere_0.6",
+      "iterativelatent2dradiussweep_sphere_0.8",
+      "iterativelatent2dradiussweep_cylinder_0.8",
+      "iterativelatent2dradiussweep_torus_0.8",
+      "iterativelatent2dradiussweep_corner_sphere_0.8"
+    ]
+  }
+}

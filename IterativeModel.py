@@ -31,6 +31,7 @@ torch.set_num_interop_threads(min(4, NUM_CORES // 2))
 
 print(f"Configured PyTorch to use {NUM_CORES} CPU cores.")
 
+
 # ------------------------
 # Patch DeepSDF loader for flat SdfSamples
 # ------------------------
@@ -45,6 +46,20 @@ def patch_get_instance_filenames():
     deep_data.get_instance_filenames = get_instance_filenames
 
 patch_get_instance_filenames()
+
+def safe_clean_directory(directory):
+    for f in os.listdir(directory):
+        file_path = os.path.join(directory, f)
+        try:
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+                print(f"[DEBUG] Deleted {file_path}")
+            elif os.path.isdir(file_path):            
+                shutil.rmtree(file_path)
+                print(f"[DEBUG] Deleted folder {file_path}")
+        except Exception as e:
+            print(f"[WARN] Could not delete {file_path}: {e}")
+
 
 # ------------------------
 # Caution! 
@@ -135,13 +150,13 @@ class Model:
         # Define subdirectories consistently
         split_dir = os.path.join(self.base_directory, "split")
         model_params_dir = os.path.join(self.base_directory, "ModelParameters")
-        
+        scenes_dir = os.path.join(self.base_directory, "Scenes")
         samples_dir = os.path.join(self.base_directory, "SdfSamples")
         top_latent_dir = os.path.join(self.base_directory, "LatentCodes")
         optimizer_params_dir = os.path.join(self.base_directory, "OptimizerParameters")
 
         # Create them if needed
-        for d in [self.base_directory, split_dir, model_params_dir, samples_dir, top_latent_dir]:
+        for d in [self.base_directory, split_dir, model_params_dir, scenes_dir, samples_dir, top_latent_dir]:
             os.makedirs(d, exist_ok=True)
     
         print(f"[DEBUG] Using experiment directory: {self.base_directory}")
@@ -357,85 +372,176 @@ class Model:
                 # ---------------- Save ----------------
                 np.savez_compressed(samples_file, pos=pos, neg=neg)
 
-        # ---------------- Training (Single Pass Over All Scenes) ----------------
-        print(f"[INFO] Starting unified DeepSDF training for all {len(self.scenes)} scenes.")
-
-        # Find if we have an existing checkpoint
-        existing_model_ckpts = [
-            f for f in os.listdir(model_params_dir) if f.endswith(".pth") and f[:-4].isdigit()
-        ]
-        existing_latent_ckpts = [
-            f for f in os.listdir(top_latent_dir) if f.endswith(".pth") and f[:-4].isdigit()
-        ]
-        latest_epoch = max([int(f[:-4]) for f in existing_model_ckpts], default=0)
-        resume_ckpt = str(latest_epoch) if existing_model_ckpts else None
-
-        if resume_ckpt:
-            print(f"[INFO] Resuming from epoch {latest_epoch}")
-        else:
-            print("[INFO] Starting training from scratch")
-
-        # Initialize latent codes if not found
-        if not existing_latent_ckpts:
-            sigma = 1.0 / math.sqrt(self.latentDim)
-            init_latents = torch.normal(0.0, sigma, size=(len(self.scenes), self.latentDim))
-            init_latent_dict = {
-                "latent_codes": {"weight": init_latents},
-                "epoch": 0
-            }
-            torch.save(init_latent_dict, os.path.join(top_latent_dir, "0.pth"))
-            print(f"[INFO] Initialized new latent code matrix for {len(self.scenes)} scenes.")
-
-        # Create dummy logs if needed (DeepSDF expects it)
-        logs_file = os.path.join(self.base_directory, "Logs.pth")
-        if not os.path.exists(logs_file):
-            torch.save({
-                "loss": [0.0],
-                "learning_rate": [0.001],
-                "timing": [0.0],
-                "latent_magnitude": [0.0],
-                "param_magnitude": {"dummy": [0.0]},
-                "epoch": [latest_epoch],
-            }, logs_file)
-
-        # Run DeepSDF once for all scenes
-        old_cwd = os.getcwd()
-        os.chdir(self.base_directory)
-        try:
-            training.train_deep_sdf(
-                experiment_directory=self.base_directory,
-                data_source=self.base_directory,
-                continue_from=resume_ckpt,
-                batch_split=1
-            )
-        finally:
-            os.chdir(old_cwd)
-
-        # ---------------- Load final trained latents ----------------
-        post_ckpts = [
-            f for f in os.listdir(top_latent_dir) if f.endswith(".pth") and f[:-4].isdigit()
-        ]
-        if not post_ckpts:
-            raise RuntimeError(f"No latent checkpoints found in {top_latent_dir}")
-        final_epoch = max(int(f[:-4]) for f in post_ckpts)
-        top_latent_path = os.path.join(top_latent_dir, f"{final_epoch}.pth")
-
-        latent_data = torch.load(top_latent_path, map_location="cpu")
-        latent_weight = latent_data["latent_codes"]["weight"]
-
-        print(f"[INFO] Loaded final latent codes from epoch {final_epoch}: shape = {latent_weight.shape}")
-
-        # ---------------- Register trained scenes ----------------
-        for idx, scene_id in enumerate(self.scenes.keys()):
+        # ---------------- Training Loop ----------------
+        for scene_idx, (scene_id, scene_with_operators) in enumerate(self.scenes.items()):
             scene_key = f"{self.model_name.lower()}_{scene_id}"
-            latent_vec = latent_weight[idx]
+            scene_folder = os.path.join(scenes_dir, scene_id)
+            scene_latent_dir = os.path.join(scene_folder, "LatentCodes")
+            os.makedirs(scene_latent_dir, exist_ok=True)
+
+
+            # ---------------- Check per-scene latent snapshots ----------------
+            existing_scene_ckpts = [
+                f for f in os.listdir(scene_latent_dir) if f.endswith(".pth") and f[:-4].isdigit()
+            ]
+            if existing_scene_ckpts:
+                continue
+            
+            # ---------------- Find latest latent checkpoint ----------------
+            existing_model_ckpts = [
+                f for f in os.listdir(model_params_dir)
+                if f.endswith(".pth") and f[:-4].isdigit()
+            ]
+            existing_latent_ckpts = [
+                f for f in os.listdir(top_latent_dir)
+                if f.endswith(".pth") and f[:-4].isdigit()
+            ]
+
+            if existing_model_ckpts!= existing_latent_ckpts:
+                print("[DEBUG] Mismatch between latent and model checkpoints")
+
+            elif existing_model_ckpts:
+                resume_ckpt = f"{latest_epoch}"
+                print(f"[INFO] Resuming from epoch {latest_epoch}")
+            else:
+                resume_ckpt = None
+                print("[INFO] Starting from scratch")
+
+
+            # ---------------- Train ----------------
+            if(latest_epoch < specs["NumEpochs"]):
+                old_cwd = os.getcwd()
+                os.chdir(self.base_directory)
+                try:
+                    logs_file = os.path.join(self.base_directory, "Logs.pth")
+                    if os.path.exists(logs_file):
+                        logs_data = torch.load(logs_file)
+                        # update epoch to last checkpoint (or 0 if fresh)
+                        logs_data["epoch"] = [latest_epoch]
+                        torch.save(logs_data, logs_file)
+                    else:
+                        # Create minimal log if none exists
+                        torch.save({
+                            "loss": [0.0],
+                            "learning_rate": [0.001],
+                            "timing": [0.0],
+                            "latent_magnitude": [0.0],
+                            "param_magnitude": {"dummy": [0.0]},
+                            "epoch": [latest_epoch],
+                        }, logs_file)
+                
+                    training.train_deep_sdf(
+                        experiment_directory=self.base_directory,
+                        data_source=self.base_directory,
+                        continue_from=resume_ckpt,
+                        batch_split=1
+                    )
+                finally:
+                    os.chdir(old_cwd)
+
+            # ---------------- Load final top-level latent dict ----------------
+            post_ckpts = [
+                f for f in os.listdir(top_latent_dir)
+                if f.endswith(".pth") and f[:-4].isdigit()
+            ]
+            if not post_ckpts:
+                raise RuntimeError(f"No latent checkpoints found in {top_latent_dir}")
+
+            final_epoch = max(int(f[:-4]) for f in post_ckpts)
+            top_latent_path = os.path.join(top_latent_dir, f"{final_epoch}.pth")
+
+            latent = torch.load(top_latent_path, map_location="cpu")
+            if "latent_codes" not in latent or "weight" not in latent["latent_codes"]:
+                raise ValueError(
+                    f"Invalid latent checkpoint format at {top_latent_path}. "
+                    f"Expected 'latent_codes[\"weight\"]'. Keys found: {latent.keys()}"
+                )
+
+            latent_weight = latent["latent_codes"]["weight"]
+
+            # ---------------- Sanity check latent count ----------------
+            expected_latents = scene_idx + 1
+            if latent_weight.shape[0] > expected_latents:
+                print(f"[WARN] Truncating latent matrix: {latent_weight.shape[0]} → {expected_latents}")
+                latent_weight = latent_weight[:expected_latents]
+            elif latent_weight.shape[0] < expected_latents:
+                sigma = 1.0 / math.sqrt(self.latentDim)
+                extra = torch.normal(0.0, sigma, size=(expected_latents - latent_weight.shape[0], self.latentDim))
+                latent_weight = torch.cat([latent_weight, extra], dim=0)
+                print(f"[INFO] Expanded latent matrix to {expected_latents} entries")
+
+            # ---------------- Append latent for next scene (if any) ----------------
+            if (scene_idx + 1) < len(self.scenes.keys()):
+                sigma = 1.0 / math.sqrt(self.latentDim)
+                new_latent = torch.normal(0.0, sigma, size=(1, self.latentDim))
+                latent_weight = torch.cat([latent_weight, new_latent], dim=0)
+                print(f"[INFO] Added latent vector for next scene index {scene_idx + 1}")
+
+            # ---------------- Pad latent matrix to match TrainSplit (DeepSDF expectation) ----------------
+            train_split_path = os.path.join(self.base_directory, "split", "TrainSplit.json")
+            if os.path.exists(train_split_path):
+                with open(train_split_path, "r") as f:
+                    split = json.load(f)
+                train_scene_count = len(split["train"].get(self.model_name, []))
+                if train_scene_count > 0 and latent_weight.shape[0] != train_scene_count:
+                    print(f"[WARN] Adjusting latent matrix to match TrainSplit: "
+                        f"{latent_weight.shape[0]} → {train_scene_count}")
+                    sigma = 1.0 / math.sqrt(self.latentDim)
+                    if latent_weight.shape[0] < train_scene_count:
+                        pad = torch.normal(0.0, sigma, size=(train_scene_count - latent_weight.shape[0], self.latentDim))
+                        latent_weight = torch.cat([latent_weight, pad], dim=0)
+                    else:
+                        latent_weight = latent_weight[:train_scene_count]
+
+            # ---------------- Update latent structure ----------------
+            latent = {
+                "latent_codes": {"weight": latent_weight},
+                "epoch": 0 
+            }
+
+
+            # ---------------- Save per-scene latent ----------------
+            scene_ckpt_file = os.path.join(scene_latent_dir, f"{final_epoch}.pth")
+            torch.save(latent, scene_ckpt_file)
+            print(f"[INFO] Saved per-scene latent for '{scene_id}' → {scene_ckpt_file}")
+
+            # ---------------- Reset parameters ----------------
+            optimizer_params_path = os.path.join(optimizer_params_dir, f"{final_epoch}.pth")
+            optimizer_params = torch.load(optimizer_params_path,map_location="cpu" )
+            new_optimizer_params_path = os.path.join(optimizer_params_dir, "0.pth")
+
+            model_params_path = os.path.join(model_params_dir, f"{final_epoch}.pth")
+            model_params = torch.load(model_params_path, map_location="cpu")
+            new_model_params_ckpt_file = os.path.join(model_params_dir, "0.pth")
+
+            # Reset any internal epoch counters if present
+            if "epoch" in optimizer_params:
+                optimizer_params["epoch"] = 0
+            if "epoch" in model_params:
+                model_params["epoch"] = 0
+
+            # Clean directories for next run
+            safe_clean_directory(top_latent_dir)
+            safe_clean_directory(model_params_dir)
+            safe_clean_directory(optimizer_params_dir)  
+
+            torch.save (optimizer_params,new_optimizer_params_path )
+            # Save reset model parameters
+            torch.save(model_params, new_model_params_ckpt_file)
+            print(f"[INFO] Reset model parameters saved to {new_model_params_ckpt_file}")
+
+            # ---------------- Save updated top-level latent dict ----------------
+            top_ckpt_file = os.path.join(top_latent_dir, "0.pth")
+            torch.save(latent, top_ckpt_file)
+            print(f"[INFO] Updated top-level latent dictionary saved to {top_ckpt_file}")
+
+            # ---------------- Retrieve current scene latent ----------------
+            latent_vector = latent_weight[scene_idx]
             self.trained_scenes[scene_key] = Scene(
                 parent_model=self,
                 scene_key=scene_key,
-                latent_vector=latent_vec
+                latent_vector=latent_vector  # only this scene's vector
             )
-        print(f"[INFO] Registered {len(self.trained_scenes)} trained scenes.")
-
 
     def get_scene(self, scene_key: str) -> "Scene":
         """Return a Scene instance by key."""
