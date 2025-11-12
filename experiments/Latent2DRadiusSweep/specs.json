@@ -39,7 +39,7 @@
     "geom_dimension": 3
   },
   "CodeLength": 2,
-  "NumEpochs": 5,
+  "NumEpochs": 20,
   "SnapshotFrequency": 1,
   "AdditionalSnapshots": [
     1,
@@ -58,7 +58,7 @@
     }
   ],
   "SamplesPerScene": 5000,
-  "ScenesPerBatch": 1,
+  "ScenesPerBatch": 16,
   "DataLoaderThreads": 1,
   "ClampingDistance": 0.1,
   "CodeRegularization": true,

@@ -68,7 +68,9 @@ class Model:
         resume: bool = True,
         domainRadius: float = 1.0,
         latentDim: int = 1,
-        FORCE_ONLY_FINAL_SNAPSHOT: bool = False
+        FORCE_ONLY_FINAL_SNAPSHOT: bool = False,
+        NumEpochs: int =500,
+        ScenesPerBatch: int = 0,
     ):
         self.base_directory = base_directory
         self.model_name = model_name
@@ -78,6 +80,11 @@ class Model:
         self.latentDim = latentDim
         self.FORCE_ONLY_FINAL_SNAPSHOT = FORCE_ONLY_FINAL_SNAPSHOT
         self.trained_scenes: Dict[str,Scene] = {}
+        self.NumEpochs = NumEpochs
+        if ScenesPerBatch >0:
+            self.ScenesPerBatch = ScenesPerBatch
+        else:
+            self.ScenesPerBatch = len(scenes)
 
     from DeepSDFStruct.deep_sdf.networks.deep_sdf_decoder import DeepSDFDecoder
 
@@ -87,11 +94,12 @@ class Model:
     ):
         """
         Train a DeepSDF model on SDFs with compatibility to interpolate between SDFs.
-        Interpolation is achieved via operator parameters. 
+        Operator codes are provided optionally as an attempt to encode multiple functions in a scene.
         Scenes and operators for a scene are wrapped to contain additional input parameters beyond xyz.
         The only condition for compatibility is that all scenes and operators must have the same number of additional parameters.
         Additionally the model should only be trained on watertight smooth shapes for best results.
         If only one opertor is provided per scene the operator code input is omitted.
+
         """
 
         # ------------- derive global param space from scenes -------------
@@ -185,7 +193,7 @@ class Model:
                     "geom_dimension": geom_n_params
                 },
                 "CodeLength": self.latentDim,
-                "NumEpochs": 5,
+                "NumEpochs": self.NumEpochs,
                 "SnapshotFrequency": 1,
                 "AdditionalSnapshots": [1, 5],
                 "LearningRateSchedule": [
@@ -193,7 +201,7 @@ class Model:
                     {"Type": "Constant", "Value": 0.001}
                 ],
                 "SamplesPerScene": 5000,
-                "ScenesPerBatch": 1,
+                "ScenesPerBatch": self.ScenesPerBatch,
                 "DataLoaderThreads": 1,
                 "ClampingDistance": 0.1,
                 "CodeRegularization": True,

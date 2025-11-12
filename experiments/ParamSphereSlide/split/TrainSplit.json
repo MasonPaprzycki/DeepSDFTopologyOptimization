@@ -1,0 +1,7 @@
+{
+  "train": {
+    "model": [
+      "model_sphere_slide"
+    ]
+  }
+}

@@ -20,21 +20,27 @@ os.makedirs(os.path.join(EXPERIMENT_ROOT, "plots"), exist_ok=True)
 
 print(f"[DEBUG] EXPERIMENT_ROOT = {EXPERIMENT_ROOT}")
 
-# ---------------------------
-# Define radii to sweep
-# ---------------------------
 radii = [0.2, 0.4, 0.6, 0.8]
 
-# ---------------------------
-# Create scenes dict dynamically
-# ---------------------------
+def make_sphere_scene(r):
+    return lambda xyz, params=None: SphereSDF(center=torch.zeros(3), radius=r)._compute(xyz)
+
+def make_cylinder_scene(r):
+    return lambda xyz, params=None: CylinderSDF(point=torch.zeros(3), axis="y", radius=r)._compute(xyz)
+
+def make_torus_scene(r):
+    return lambda xyz, params=None: TorusSDF(center=torch.zeros(3), R=r, r=r/3)._compute(xyz)
+
+def make_corner_sphere_scene(r):
+    return lambda xyz, params=None: CornerSpheresSDF(radius=r)._compute(xyz)
+
 scenes = {}
 for r in radii:
-    scenes[f"sphere_{r}"] = {0: (lambda xyz, params=None, r=r: SphereSDF(center=torch.zeros(3), radius=r)._compute(xyz), [])}
-    scenes[f"cylinder_{r}"] = {0: (lambda xyz, params=None, r=r: CylinderSDF(point=torch.zeros(3), axis="y", radius=r)._compute(xyz), [])}
-    scenes[f"torus_{r}"] = {0: (lambda xyz, params=None, r=r: TorusSDF(center=torch.zeros(3), R=r, r=r/3)._compute(xyz), [])}
-    scenes[f"corner_sphere_{r}"] = {0: (lambda xyz, params=None, r=r: CornerSpheresSDF(radius=r)._compute(xyz), [])}
-
+    scenes[f"sphere_{r}"] = {0: (make_sphere_scene(r), [])}
+    scenes[f"cylinder_{r}"] = {0: (make_cylinder_scene(r), [])}
+    scenes[f"torus_{r}"] = {0: (make_torus_scene(r), [])}
+    scenes[f"corner_sphere_{r}"] = {0: (make_corner_sphere_scene(r), [])}
+    
 # ---------------------------
 # Model initialization
 # ---------------------------
@@ -43,7 +49,8 @@ model = Model(
     model_name="Latent2DRadiusSweep",  # <-- no underscores to avoid KeyError
     scenes=scenes,
     resume=True,
-    latentDim=2
+    latentDim=2,
+    NumEpochs=20
 )
 
 # ---------------------------

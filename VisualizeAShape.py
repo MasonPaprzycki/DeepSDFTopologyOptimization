@@ -12,77 +12,78 @@ def visualize_a_shape(
     scene_id=None,
     grid_res=128,
     clamp_dist=0.1,
-    param_values=None,     # list of parameter vectors, e.g. [[1,2,3], [2,3,4]]
-    latent=None,           # directly supplied latent vector, optional
+    param_values=None,
+    latent=None,
     save_suffix=None,
     experiment_root=None,
+    grid_center=(0.0, 0.0, 0.0),
 ):
     """
-    Visualize a DeepSDF-trained shape with optional discrete parameter vectors.
-
-    Args:
-        model_name (str): Name of the model (directory under 'trained_models').
-        scene_id (int, optional): Scene ID to load latent from. If None, must provide 'latent'.
-        grid_res (int): Resolution of SDF grid.
-        clamp_dist (float): Clamp distance for SDF values.
-        param_values (List[List[float]], optional): List of parameter vectors, each defining a case.
-        latent (torch.Tensor, optional): Direct latent vector override.
-        save_suffix (str, optional): Suffix for saved mesh files.
-
-    Returns:
-        List[trimesh.Trimesh]: List of meshes generated.
+    Visualize a DeepSDF-trained shape following the same folder structure that Model.py actually writes.
+    (No nested 'model/' folder under the experiment directory.)
     """
 
-    # ---------------- Preconditions ----------------
     if scene_id is None and latent is None:
-        print("there was no scenes or latent cases to visualize")
+        print("[WARN] No scene ID or latent vector provided.")
         return []
 
-    # Ensure parameter cases are iterable
-    if param_values is None or len(param_values) == 0:
-        param_values = [None]  # visualize default case (no params)
+    if not param_values:
+        param_values = [None]
 
     meshes = []
 
     # ---------------- Paths ----------------
-    if experiment_root is not None:
-        root = os.path.join(experiment_root, "trained_models", model_name)
-    else:
-        root = os.path.join("trained_models", model_name)
-        
-    scene_str = f"{scene_id:03d}" if isinstance(scene_id, int) else str(scene_id)
-    scene_key = f"{model_name.lower()}_{scene_str}" if scene_id is not None else None
+    # Model.py writes directly to experiment_root, not to experiment_root/model_name
+    root = experiment_root if experiment_root else os.getcwd()
 
-    scene_dir = os.path.join(root, "Scenes", scene_str) if scene_id is not None else root
-    latent_dir = os.path.join(scene_dir, "LatentCodes") if scene_id is not None else None
-    decoderCheckpoint = os.path.join(root, "ModelParameters", "latest.pth")
+    model_params_dir = os.path.join(root, "ModelParameters")
+    latent_dir = os.path.join(root, "LatentCodes")
     specs_file = os.path.join(root, "specs.json")
+
+    # ---------------- Find checkpoints ----------------
+    if not os.path.exists(model_params_dir):
+        raise FileNotFoundError(f"[ERR] Missing folder: {model_params_dir}")
+
+    decoder_ckpts = [
+        f for f in os.listdir(model_params_dir)
+        if f.endswith(".pth") and f[:-4].isdigit()
+    ]
+    if not decoder_ckpts:
+        raise FileNotFoundError(f"No trained decoder checkpoints found in {model_params_dir}")
+    latest_epoch = max(int(f[:-4]) for f in decoder_ckpts)
+    decoder_checkpoint = os.path.join(model_params_dir, f"{latest_epoch}.pth")
+    print(f"[INFO] Using decoder checkpoint → {decoder_checkpoint}")
 
     # ---------------- Load latent ----------------
     if latent is not None:
-        latentVector = latent.view(1, -1)
+        latent_vector = latent.view(1, -1)
         print("[INFO] Using provided latent vector directly.")
-
     elif scene_id is not None:
-        scene_latest_latent = os.path.join(latent_dir, "latest.pth") # type: ignore
-        if not os.path.exists(scene_latest_latent):
-            raise FileNotFoundError(f"No latest.pth found for scene {scene_key}")
-        latents = torch.load(scene_latest_latent, map_location="cpu")["latent_codes"]
-        if scene_key not in latents:
-            raise KeyError(f"Scene key '{scene_key}' not found in latent codes.")
-        latentVector = latents[scene_key].view(1, -1)
-        print(f"[INFO] Loaded latent for scene {scene_key}.")
+        if not os.path.exists(latent_dir):
+            raise FileNotFoundError(f"[ERR] Missing folder: {latent_dir}")
 
+        latent_ckpts = [
+            f for f in os.listdir(latent_dir)
+            if f.endswith(".pth") and f[:-4].isdigit()
+        ]
+        if not latent_ckpts:
+            raise FileNotFoundError(f"No latent checkpoints found in {latent_dir}")
+        latest_latent_epoch = max(int(f[:-4]) for f in latent_ckpts)
+        latent_path = os.path.join(latent_dir, f"{latest_latent_epoch}.pth")
+
+        latent_data = torch.load(latent_path, map_location="cpu")
+        latent_codes = latent_data["latent_codes"]["weight"]
+
+        latent_vector = latent_codes[scene_id].view(1, -1)
+        print(f"[INFO] Loaded latent vector for scene {scene_id} from epoch {latest_latent_epoch}.")
     else:
-        print("there was no scenes or latent cases to visualize")
-        return []
+        raise RuntimeError("No latent data available.")
 
     # ---------------- Load decoder ----------------
     with open(specs_file) as f:
         specs = json.load(f)
 
     geom_dim = specs["NetworkSpecs"].get("geom_dimension", 3)
-
     decoder = Decoder(
         latent_size=specs["CodeLength"],
         dims=specs["NetworkSpecs"]["dims"],
@@ -94,85 +95,67 @@ def visualize_a_shape(
         use_tanh=specs["NetworkSpecs"].get("use_tanh", False),
     )
 
-    ckpt = torch.load(decoderCheckpoint, map_location="cpu")
+    ckpt = torch.load(decoder_checkpoint, map_location="cpu")
     decoder.load_state_dict(ckpt["model_state_dict"])
     decoder.eval()
 
-    # ---------------- Grid setup ----------------
-    x = y = z = np.linspace(-1.2, 1.2, grid_res)
+    # ---------------- Grid ----------------
+    x = np.linspace(grid_center[0] - 1.2, grid_center[0] + 1.2, grid_res)
+    y = np.linspace(grid_center[1] - 1.2, grid_center[1] + 1.2, grid_res)
+    z = np.linspace(grid_center[2] - 1.2, grid_center[2] + 1.2, grid_res)
     grid = np.stack(np.meshgrid(x, y, z, indexing="ij"), -1)
     xyz_points = torch.from_numpy(grid.reshape(-1, 3)).float()
 
-  # ---------------- Visualize each param case ----------------
-    for idx, param_case in enumerate(param_values or [None]):
+    # ---------------- Loop over parameter cases ----------------
+    for idx, param_case in enumerate(param_values):
         pts = xyz_points.clone()
 
-        # ---------------- Append parameters to coordinates if given ----------------
         if param_case is not None:
-            # Validate parameter format
-            if not isinstance(param_case, (list, tuple, np.ndarray, torch.Tensor)):
-                raise TypeError(
-                    f"Each param_values entry must be a list, tuple, numpy array, or tensor. Got {type(param_case)}."
-                )
-
-            # Convert to torch tensor
             param_tensor = torch.as_tensor(param_case, dtype=torch.float32).view(1, -1)
-            param_repeat = param_tensor.repeat(pts.shape[0], 1)
-            pts = torch.cat([pts, param_repeat], dim=1)
-            print(f"[INFO] Visualizing case {idx + 1}/{len(param_values)} with parameters: {param_case}")
+            pts = torch.cat([pts, param_tensor.repeat(pts.shape[0], 1)], dim=1)
+            print(f"[INFO] Visualizing param case {idx+1}: {param_case}")
         else:
-            print(f"[INFO] Visualizing default (no parameter conditioning) case {idx + 1}.")
+            print(f"[INFO] Visualizing default case {idx+1}")
 
-        # ---------------- Evaluate SDF ----------------
+        # Evaluate SDF
         sdf_vals = []
-        batch = 50000
         with torch.no_grad():
-            for i in range(0, len(pts), batch):
-                chunk = pts[i:i + batch]
-                latent_repeat = latentVector.repeat(chunk.size(0), 1)
+            for i in range(0, len(pts), 50000):
+                chunk = pts[i:i + 50000]
+                latent_repeat = latent_vector.repeat(chunk.size(0), 1)
                 decoder_input = torch.cat([latent_repeat, chunk], dim=1)
                 sdf_chunk = decoder(decoder_input)
                 sdf_vals.append(sdf_chunk.squeeze(1).cpu())
-
         sdf = torch.cat(sdf_vals).numpy()
-        volume = np.clip(sdf.reshape(grid_res, grid_res, grid_res), -clamp_dist, clamp_dist)
 
-        # ---------------- Surface extraction ----------------
+        volume = np.clip(sdf.reshape(grid_res, grid_res, grid_res), -clamp_dist, clamp_dist)
+        min_sdf, max_sdf = volume.min(), volume.max()
+        if not (min_sdf < 0 < max_sdf):
+            print(f"[WARN] No zero-crossing found (min={min_sdf:.4f}, max={max_sdf:.4f}) — skipping mesh.")
+            continue
+
         verts, faces, normals, _ = measure.marching_cubes(volume, level=0.0)
         scale = x[1] - x[0]
         verts = verts * scale + np.array([x[0], y[0], z[0]])
         mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_normals=normals)
 
         # ---------------- Save mesh ----------------
-        mesh_dir = (
-            os.path.join(scene_dir, "Meshes")
-            if scene_id is not None
-            else os.path.join(root, "Meshes")
-        )
+        mesh_dir = os.path.join(root, "Meshes")
         os.makedirs(mesh_dir, exist_ok=True)
 
-        # ---------------- Build filename suffix ----------------
-        suffix_parts = []
-        if isinstance(param_case, (list, tuple, np.ndarray, torch.Tensor)):
-            # Ensure we iterate safely over parameter case
-            safe_param_str = "_".join([
+        suffix = []
+        if param_case is not None:
+            safe_param = "_".join([
                 f"{float(v):+.2f}".replace("+", "p").replace("-", "m")
                 for v in np.atleast_1d(param_case)
             ])
-            suffix_parts.append(f"params{safe_param_str}")
-
+            suffix.append(f"params{safe_param}")
         if save_suffix:
-            suffix_parts.append(str(save_suffix))
+            suffix.append(save_suffix)
+        suffix.append(f"case{idx:02d}")
+        suffix_str = "_" + "_".join(suffix)
 
-        suffix_parts.append(f"case{idx:02d}")
-        suffix = "_" + "_".join(suffix_parts)
-
-        # ---------------- File naming ----------------
-        if scene_id is not None:
-            mesh_filename = f"{model_name.lower()}_{scene_id:03d}{suffix}_mesh.ply"
-        else:
-            mesh_filename = f"{model_name.lower()}_latent{suffix}_mesh.ply"
-
+        mesh_filename = f"{model_name.lower()}_{scene_id}{suffix_str}_mesh.ply"
         mesh_path = os.path.join(mesh_dir, mesh_filename)
         mesh.export(mesh_path)
         print(f"[INFO] Saved mesh → {mesh_path}")
