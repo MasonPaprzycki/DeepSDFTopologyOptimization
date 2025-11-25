@@ -4,156 +4,164 @@ import torch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import trimesh
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import imageio.v2 as imageio
-import trimesh
 
 from DeepSDFStruct.sdf_primitives import SphereSDF
 from Model import Model
 import VisualizeAShape
 
-
-# ---------------------------
-# Experiment setup
-# ---------------------------
+# ======================================================
+# Experiment Setup
+# ======================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(SCRIPT_DIR)
 
 
-EXPERIMENT_NAME = "ParamSphereSlide"
+EXPERIMENT_NAME = "SlidingSphere"
 EXPERIMENT_ROOT = os.path.join(REPO_ROOT, "experiments", EXPERIMENT_NAME)
+
 os.makedirs(EXPERIMENT_ROOT, exist_ok=True)
 os.makedirs(os.path.join(EXPERIMENT_ROOT, "plots"), exist_ok=True)
+os.makedirs(os.path.join(EXPERIMENT_ROOT, "Meshes"), exist_ok=True)
 
-print(f"[DEBUG] EXPERIMENT_ROOT = {EXPERIMENT_ROOT}")
+print(f"[INFO] Experiment directory: {EXPERIMENT_ROOT}")
 
-# ---------------------------
-# Define a parameterized Sphere scene that slides along x
-# ---------------------------
+# ======================================================
+# Scene Generation: Sphere at different x-positions
+# ======================================================
+def make_sphere_scene(cx: float):
+    """Return SDF function for a sphere of radius 0.4 at x=cx."""
+    return lambda xyz, params=None: SphereSDF(
+        center=torch.tensor([cx, 0.0, 0.0], dtype=xyz.dtype, device=xyz.device),
+        radius=0.4
+    )._compute(xyz)
 
-def make_sliding_sphere_scene():
-    def sdf_fn(xyz: torch.Tensor, params: torch.Tensor | None):
-        if params is None:
-            cx = 0.0
-        else:
-            cx = params[:, 0] if params.dim() > 1 else params[0]
-        center = torch.tensor([cx, 0.0, 0.0])
-        return SphereSDF(center=center, radius=0.4)._compute(xyz)
-    return sdf_fn
+# Generate 12 scenes along x in [-0.8, 0.8]
+num_scenes = 12
+x_positions = np.linspace(-0.8, 0.8, num_scenes)
 
+scenes = {}
+for cx in x_positions:
+    key = f"sphere_{cx:.2f}"
+    scenes[key] = {0: (make_sphere_scene(cx), [])}
 
-# ---------------------------
-# Scene dictionary
-# ---------------------------
+print(f"[INFO] Created {num_scenes} sphere scenes: {list(scenes.keys())}")
 
-scenes = {
-    "sphere_slide": {
-        0: (make_sliding_sphere_scene(), [(-0.8, 0.8)])
-    }
-}
-
-
-# ---------------------------
-# Initialize the model
-# ---------------------------
-
+# ======================================================
+# Initialize Model
+# ======================================================
 model = Model(
     base_directory=EXPERIMENT_ROOT,
-    model_name="model",
+    model_name="SlidingSphereModel",
     scenes=scenes,
     resume=False,
-    latentDim=1,
-    NumEpochs=5,
+    latentDim=1,  # 1D latent
+    NumEpochs=60, # more epochs for smooth latent interpolation
 )
 
+print("[INFO] Model initialized. Starting training...")
 
-# ---------------------------
-# Training and visualization
-# ---------------------------
-
+# ======================================================
+# Training & Visualization
+# ======================================================
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
 
-    print("[INFO] Starting training...")
+    # Train model
     model.trainModel()
+    print("[INFO] Training complete.")
 
-    # -----------------------------------------
-    # Latent interpolation visualization
-    # -----------------------------------------
-    print("[INFO] Interpolating between first and last scenes...")
+    # ======================================================
+    # Collect 1D latent codes
+    # ======================================================
+    print("[DEBUG] Scene keys: ", list(model.trained_scenes.keys()))
+    scene_keys = sorted(
+        list(model.trained_scenes.keys()), 
+        key=lambda k: float(k.split("_")[2])
+    )
 
-    trained_keys = list(model.trained_scenes.keys())
-    first_key, last_key = trained_keys[0], trained_keys[-1]
+    latents = torch.stack([
+        model.trained_scenes[k].get_latent_vector().detach().cpu()
+        for k in scene_keys
+    ])
+    latents_np = latents.numpy()
 
-    latent_start = model.trained_scenes[first_key].get_latent_vector().detach()
-    latent_end = model.trained_scenes[last_key].get_latent_vector().detach()
+    # ------------------------------------------------------
+    # Plot latent space (1D along x-axis)
+    # ------------------------------------------------------
+    plt.figure(figsize=(6, 3))
+    plt.scatter(latents_np[:,0], np.zeros_like(latents_np[:,0]), color='royalblue', s=80)
 
-    print(f"[INFO] Interpolating between '{first_key}' and '{last_key}'")
+    for i, key in enumerate(scene_keys):
+        plt.text(latents_np[i,0] + 0.01, 0.0, key.split("_")[2], fontsize=9)
 
-    num_steps = 10
-    interpolated_latents = [
-        (1 - t) * latent_start + t * latent_end
-        for t in np.linspace(0.0, 1.0, num_steps)
-    ]
+    plt.xlabel("Latent Dimension 1")
+    plt.yticks([])
+    plt.grid(True)
+    plt.tight_layout()
 
+    plot_path = os.path.join(EXPERIMENT_ROOT, "plots", "latent_space_1d.png")
+    plt.savefig(plot_path, dpi=300)
+    plt.close()
+    print(f"[INFO] 1D latent space plot saved to: {plot_path}")
+
+    # ======================================================
+    # Generate meshes along latent interpolation
+    # ======================================================
+    num_interp_steps = num_scenes
+    interpolated_latents = latents  # already ordered along x
     mesh_paths = []
 
-    num_steps = 10
-    x_positions = np.linspace(-0.8, 0.8, num_steps)
+    print("[INFO] Generating meshes for each latent...")
+
 
     for i, latent in enumerate(interpolated_latents):
-        grid_center = (x_positions[i], 0.0, 0.0)
+        # Extract center from scene key
+        cx = float(scene_keys[i].split("_")[2])
         meshes = VisualizeAShape.visualize_a_shape(
-            model_name="model",
+            model_name="SlidingSphereModel",
             latent=latent,
             grid_res=96,
             clamp_dist=0.1,
-            save_suffix=f"latent_interp_{i:02d}",
+            save_suffix=f"interp_{i:02d}",
             experiment_root=EXPERIMENT_ROOT,
-            grid_center=grid_center
+            grid_center=(cx, 0.0, 0.0)
         )
 
         if meshes:
-            mesh_dir = os.path.join(EXPERIMENT_ROOT, "trained_models", "model", "Meshes")
-            os.makedirs(mesh_dir, exist_ok=True)
-            mesh_filename = f"model_latent_latent_interp_{i:02d}_mesh.ply"
-            mesh_path = os.path.join(mesh_dir, mesh_filename)
+            mesh = meshes[0]
+            mesh_path = os.path.join(EXPERIMENT_ROOT, "Meshes", f"interp_{i:02d}.ply")
+            mesh.export(mesh_path)
             mesh_paths.append(mesh_path)
+            print(f"[INFO] Saved mesh: {mesh_path}")
+        else:
+            print(f"[WARN] No mesh output for step {i}")
 
-    print(f"[INFO] Latent interpolation visualization complete!")
+    print("[INFO] Mesh generation complete.")
 
-    
-    # -----------------------------------------
-    # Render animation from meshes
-    # -----------------------------------------
+    # ======================================================
+    # Render animation
+    # ======================================================
     print("[INFO] Rendering animation...")
 
     frames = []
     for mesh_path in mesh_paths:
         mesh = trimesh.load(mesh_path)
-
-        # Handle general Geometry types
         if hasattr(mesh, "geometry") and isinstance(mesh.geometry, dict):
-            # It's a Scene -> combine geometries
-            combined = []
-            for geom in mesh.geometry.values():
-                if hasattr(geom, "vertices") and hasattr(geom, "faces"):
-                    combined.append(geom)
-            mesh = trimesh.util.concatenate(combined)
+            geom_list = [
+                geom for geom in mesh.geometry.values()
+                if hasattr(geom, "vertices") and hasattr(geom, "faces")
+            ]
+            mesh = trimesh.util.concatenate(geom_list)
 
-        elif not hasattr(mesh, "vertices") or not hasattr(mesh, "faces"):
-            raise TypeError(f"Loaded object from {mesh_path} is not a triangular mesh!")
-
-        # Now we are guaranteed to have a Trimesh-like object
-        vertices = mesh.vertices
-        faces = mesh.faces
-
-        fig = plt.figure(figsize=(5, 5))
+        fig = plt.figure(figsize=(5,5))
         ax = fig.add_subplot(111, projection='3d')
 
         ax.add_collection3d(Poly3DCollection(
-            vertices[faces],
+            mesh.vertices[mesh.faces],
             facecolor='lightblue',
             edgecolor='k',
             linewidth=0.1,
@@ -167,13 +175,11 @@ if __name__ == "__main__":
         ax.set_box_aspect([1, 1, 1])
         plt.axis('off')
 
-        frame_path = os.path.join(EXPERIMENT_ROOT, f"frame_{os.path.basename(mesh_path)}.png")
+        frame_path = mesh_path.replace(".ply", ".png")
         plt.savefig(frame_path, dpi=100, bbox_inches='tight')
         plt.close(fig)
-
         frames.append(imageio.imread(frame_path))
 
-    gif_path = os.path.join(EXPERIMENT_ROOT, "sphere_slide_animation.gif")
+    gif_path = os.path.join(EXPERIMENT_ROOT, "sliding_sphere.gif")
     imageio.mimsave(gif_path, frames, duration=0.2)
-
-    print(f"[INFO] Animation saved to {gif_path}")
+    print(f"[INFO] Animation saved: {gif_path}")
