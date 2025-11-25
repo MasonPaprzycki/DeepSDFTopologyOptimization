@@ -39,7 +39,7 @@
     "geom_dimension": 3
   },
   "CodeLength": 1,
-  "NumEpochs": 10,
+  "NumEpochs": 500,
   "SnapshotFrequency": 1,
   "AdditionalSnapshots": [
     1,

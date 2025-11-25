@@ -38,7 +38,7 @@ def main():
         def sdf_fn(xyz, params=None):
             return SphereSDF(
                 center=torch.tensor([cx, 0.0, 0.0], dtype=xyz.dtype, device=xyz.device),
-                radius=0.4
+                radius=0.5
             )._compute(xyz)
         return sdf_fn
 
@@ -62,7 +62,7 @@ def main():
         scenes=scenes,
         resume=False,
         latentDim=1,
-        NumEpochs=10,
+        NumEpochs=500,
     )
 
     print("[INFO] Training model...")
@@ -92,8 +92,8 @@ def main():
     # Build 2D grid
     # ======================================================
     grid_res = 256
-    xv = np.linspace(-1.2, 1.2, grid_res)
-    yv = np.linspace(-1.2, 1.2, grid_res)
+    xv = np.linspace(-3, 3, grid_res)
+    yv = np.linspace(-3, 3, grid_res)
     xx, yy = np.meshgrid(xv, yv)
 
     xyz_np = np.stack([xx, yy, np.zeros_like(xx)], axis=-1)
@@ -158,7 +158,7 @@ def main():
         plt.figure(figsize=(5, 5))
         plt.imshow(
             sdf_img,
-            extent=(-1.2, 1.2, -1.2, 1.2),
+            extent=(-3, 3, -3, 3),
             cmap=custom_cmap,
             norm=norm,
             origin="lower",

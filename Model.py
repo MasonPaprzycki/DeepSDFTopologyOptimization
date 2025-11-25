@@ -6,13 +6,12 @@ import torch
 import numpy as np
 import DeepSDFStruct.deep_sdf.data as deep_data
 import DeepSDFStruct.deep_sdf.training as training
-
 from VisualizeAShape import visualize_a_shape
 import multiprocessing
 import warnings
 import math
-import shutil
 from DeepSDFStruct.deep_sdf.networks.deep_sdf_decoder import DeepSDFDecoder as Decoder
+
 # ------------------------
 # Limit CPU threads globally
 # unique to the  machine. 
@@ -256,7 +255,7 @@ class Model:
                 pos_list, neg_list = [], []
 
                 batch_size = 5000  # sample in batches to avoid memory blow-up
-                max_attempts = 100  # safety to avoid infinite loops
+                max_attempts = 1000  # safety to avoid infinite loops
 
                 for i, key in enumerate(operator_keys):
                     op_idx = list(scene_with_operators.keys()).index(key)  # find the index in param_ranges_flat
@@ -565,8 +564,25 @@ class Scene():
 
         return sdf_vals
             
-        #(xyz, params)
-        
+
+    def compute_trained_sdf(
+        self,
+        xyz: torch.Tensor,
+        params: Optional[torch.Tensor] = None,
+        chunk: int = 50000,
+    ):
+        """
+        Evaluate the trained DeepSDF decoder at xyz locations for this scene's latent vector.
+        Matches the behavior of visualize_a_shape.
+        """
+
+        return self.parent_model.compute_sdf_from_latent(
+            latent_vector=self.latent_vector,
+            xyz=xyz,
+            params=params,
+            chunk=chunk,
+        )
+    
     def get_latent_vector(self) -> torch.Tensor:
         """Return the latent vector for this scene."""
         return self.latent_vector
