@@ -1,7 +1,7 @@
 import os
 import json
 import random
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import torch
 import numpy as np
 import DeepSDFStruct.deep_sdf.data as deep_data
@@ -12,7 +12,7 @@ import multiprocessing
 import warnings
 import math
 import shutil
-
+from DeepSDFStruct.deep_sdf.networks.deep_sdf_decoder import DeepSDFDecoder as Decoder
 # ------------------------
 # Limit CPU threads globally
 # unique to the  machine. 
@@ -448,6 +448,83 @@ class Model:
     def get_scene(self, scene_key: str) -> "Scene":
         """Return a Scene instance by key."""
         return self.trained_scenes[scene_key]
+    
+    def compute_sdf_from_latent(
+        self,
+        latent_vector: torch.Tensor,
+        xyz: torch.Tensor,
+        params: Optional[torch.Tensor] = None,
+        chunk: int = 50000,
+    ):
+        """
+        Evaluate the trained DeepSDF decoder at xyz locations for a given latent vector.
+        Matches the behavior of visualize_a_shape.
+        """
+
+        root = self.base_directory
+        specs_file = os.path.join(root, "specs.json")
+
+        with open(specs_file, "r") as f:
+            specs = json.load(f)
+
+        geom_dim = specs["NetworkSpecs"].get("geom_dimension", 3)
+
+        # ---------------- Load decoder checkpoint ----------------
+        model_params_dir = os.path.join(root, "ModelParameters")
+        ckpts = [f for f in os.listdir(model_params_dir) if f.endswith(".pth") and f[:-4].isdigit()]
+        if not ckpts:
+            raise FileNotFoundError(f"No decoder checkpoints found in {model_params_dir}")
+
+        latest_epoch = max(int(f[:-4]) for f in ckpts)
+        decoder_path = os.path.join(model_params_dir, f"{latest_epoch}.pth")
+
+        # ---------------- Construct decoder ----------------
+        decoder = Decoder(
+            latent_size=specs["CodeLength"],
+            dims=specs["NetworkSpecs"]["dims"],
+            geom_dimension=geom_dim,
+            norm_layers=tuple(specs["NetworkSpecs"].get("norm_layers", ())),
+            latent_in=tuple(specs["NetworkSpecs"].get("latent_in", ())),
+            weight_norm=specs["NetworkSpecs"].get("weight_norm", False),
+            xyz_in_all=specs["NetworkSpecs"].get("xyz_in_all", False),
+            use_tanh=specs["NetworkSpecs"].get("use_tanh", False),
+        )
+
+        ckpt = torch.load(decoder_path, map_location=xyz.device)
+        decoder.load_state_dict(ckpt["model_state_dict"])
+        decoder.to(xyz.device).eval()
+
+        # ---------------- Sanitize latent ----------------
+        if latent_vector.dim() == 1:
+            latent_vector = latent_vector.unsqueeze(0)
+        latent_vector = latent_vector.to(xyz.device).float().contiguous()
+
+        # ---------------- Sanitize params ----------------
+        if params is not None:
+            if params.dim() == 1:
+                params = params.unsqueeze(0)
+            params = params.float().to(xyz.device).contiguous()
+
+        # ---------------- Chunked SDF evaluation ----------------
+        outputs = []
+        with torch.no_grad():
+            N = xyz.shape[0]
+            for i in range(0, N, chunk):
+                pts = xyz[i:i + chunk]
+
+                if params is not None:
+                    pts = torch.cat([pts, params.expand(pts.size(0), -1)], dim=1)
+
+                latent_repeat = latent_vector.expand(pts.size(0), -1)
+                decoder_input = torch.cat([latent_repeat, pts], dim=1)
+
+                sdf_chunk = decoder(decoder_input)
+                if sdf_chunk.dim() == 2:
+                    sdf_chunk = sdf_chunk[:, 0]
+                outputs.append(sdf_chunk)
+
+        return torch.cat(outputs, dim=0)
+
     
 class Scene():
     def __init__(self, parent_model: Model, scene_key: str, latent_vector: torch.Tensor):
