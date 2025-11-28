@@ -53,7 +53,8 @@ model = Model(
     scenes=scenes,
     resume=False,
     latentDim=1,
-    NumEpochs=300
+    NumEpochs=10,
+    domainRadius=0.45
 )
 
 print("[INFO] Model initialized. Starting training...")

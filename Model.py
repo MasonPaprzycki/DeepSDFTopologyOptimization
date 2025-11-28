@@ -85,10 +85,6 @@ class Model:
         else:
             self.ScenesPerBatch = len(scenes)
 
-    from DeepSDFStruct.deep_sdf.networks.deep_sdf_decoder import DeepSDFDecoder
-
-    
-
     def trainModel(self
     ):
         """
@@ -199,7 +195,7 @@ class Model:
                     {"Type": "Step", "Initial": 0.001, "Interval": 250, "Factor": 0.5},
                     {"Type": "Constant", "Value": 0.001}
                 ],
-                "SamplesPerScene": 5000,
+                "SamplesPerScene": 50000,
                 "ScenesPerBatch": self.ScenesPerBatch,
                 "DataLoaderThreads": 1,
                 "ClampingDistance": 0.1,
@@ -233,136 +229,255 @@ class Model:
         with open(train_split_path, "w") as f:
             json.dump(split_dict, f, indent=2)
 
+    
+        # -------------------------
+        # Begin scene sampling loop (robust, deterministic high angular uniformity)
+        # -------------------------
         for scene_idx, (scene_id, scene_with_operators) in enumerate(self.scenes.items()):
-            scene_key = f"{self.model_name.lower()}_{scene_id}"
+            instance_key = f"{self.model_name.lower()}_{scene_id}"
+            samples_file = os.path.join(samples_dir, f"{instance_key}.npz")
 
-            # --- SDF Samples---
-            samples_file = os.path.join(samples_dir, f"{scene_key}.npz")
-            if not os.path.exists(samples_file):
+            print("\n" + "=" * 62)
+            print(f"[SAMPLE] Begin sampling for scene: {instance_key}")
+            print("=" * 62)
 
-                # ---------------- Operator setup ----------------
-                operator_keys = list(scene_with_operators.keys())
-                random.shuffle(operator_keys)  # shuffle operators
-                n_ops = len(operator_keys)
+            if os.path.exists(samples_file):
+                print(f"[SAMPLE] Existing file found, skipping: {samples_file}")
+                continue
 
-                param_ranges_flat = global_add_param_ranges[scene_idx]
-                add_n_params_not_operator = global_add_num_params[scene_idx] -1 if n_ops >1 else global_add_num_params[scene_idx]
+            operator_keys = list(scene_with_operators.keys())
+            random.shuffle(operator_keys)
+            n_ops = len(operator_keys)
+            param_ranges_flat = global_add_param_ranges[scene_idx]
 
-                # ---------------- Adaptive sampling per operator ----------------
-                # Attempts to sample 50/50 split of inside/outside points per operator
+            cl = specs.get("ClampingDistance", 0.1)
+            batch_size = 20000
+            max_attempts = 1500
+            NUM_AZ, NUM_EL = 36, 18
+            NUM_BINS = NUM_AZ * NUM_EL
 
-                target_pos = target_neg = specs["SamplesPerScene"] // n_ops// 2
-                pos_list, neg_list = [], []
+            # -------------------------
+            # Helpers
+            # -------------------------
+         
+            # -------------------------
+            # Very high-accuracy center estimation (geometric, gradient-free)
+            # -------------------------
+            def estimate_center(sdf_fn, fallback=torch.zeros(3, dtype=torch.float32), probe_N=100000):
+                """
+                Estimate the geometric center of a shape by projecting near-surface points to the SDF zero level.
+                Works extremely well for symmetric shapes like spheres.
+                """
+                # 1. Sample points uniformly in the domain
+                probe_pts = (torch.rand(probe_N, 3) * 2 - 1) * self.domainRadius
+                sdf_vals = sdf_fn(probe_pts, None)
+                if sdf_vals.dim() == 2:
+                    sdf_vals = sdf_vals[:, 0]
 
-                batch_size = 5000  # sample in batches to avoid memory blow-up
-                max_attempts = 1000  # safety to avoid infinite loops
+                # 2. Keep only points near the surface
+                mask = torch.abs(sdf_vals) < max(0.3, cl*3)
+                if mask.sum() < 128:
+                    print("[WARN] Not enough near-surface points, falling back to origin")
+                    return fallback
 
-                for i, key in enumerate(operator_keys):
-                    op_idx = list(scene_with_operators.keys()).index(key)  # find the index in param_ranges_flat
+                near_pts = probe_pts[mask]
+                near_sdf = sdf_vals[mask]
 
-                    #if no parameter ranges for this operator → skip param sampling
-                    if len(param_ranges_flat) == 0:
-                        # sample xyz
-                        xyz = (torch.rand(batch_size, 3, dtype=torch.float32) * 2 - 1) * self.domainRadius
+                # 3. Project points toward zero level using SDF values along vector from origin
+                projected_pts = near_pts - near_sdf.unsqueeze(1) * (near_pts / (near_pts.norm(dim=1, keepdim=True) + 1e-12))
 
-                        # assemble query depending on single vs multi op
-                        if len(operator_keys) > 1:
-                            op_value = torch.full((batch_size, 1), float(i), dtype=torch.float32)
-                            queries_op = torch.cat([xyz, op_value], dim=1)
-                        else:
-                            queries_op = xyz
+                # 4. Coordinate-wise median is extremely robust
+                center_est = projected_pts.median(dim=0).values
 
-                        # evaluate SDF
-                        sdf_fn, _ = scene_with_operators[key]
-                        sdf_op_vals = sdf_fn(xyz, None)
-                        if sdf_op_vals.dim() == 1:
-                            sdf_op_vals = sdf_op_vals.unsqueeze(1)
+                # 5. Optional: refine locally with smaller random perturbation around estimated center
+                local_N = min(20000, probe_N)
+                local_pts = center_est + (torch.rand(local_N, 3) * 2 - 1) * self.domainRadius * 0.1
+                sdf_local = sdf_fn(local_pts, None)
+                if sdf_local.dim() == 2:
+                    sdf_local = sdf_local[:, 0]
+                mask_local = torch.abs(sdf_local) < max(0.3, cl*3)
+                if mask_local.sum() > 64:
+                    projected_local = local_pts[mask_local] - sdf_local[mask_local].unsqueeze(1) * \
+                                    (local_pts[mask_local] / (local_pts[mask_local].norm(dim=1, keepdim=True) + 1e-12))
+                    center_est = projected_local.median(dim=0).values
 
-                        data = torch.cat([queries_op, sdf_op_vals], dim=1).numpy()
-                        sdf_col_idx = data.shape[1] - 1
-                        batch_pos = data[np.abs(data[:, sdf_col_idx]) < specs["ClampingDistance"]]
-                        batch_neg = data[np.abs(data[:, sdf_col_idx]) >= specs["ClampingDistance"]]
+                return center_est
 
-                        if len(pos_list) < target_pos:
-                            remaining = target_pos - len(pos_list)
-                            pos_list.append(batch_pos[:remaining])
-                        if len(neg_list) < target_neg:
-                            remaining = target_neg - len(neg_list)
-                            neg_list.append(batch_neg[:remaining])
 
-                        continue  #skip the parameter sampling path completely
 
-                    # ---------- normal param case ----------
-                    low_vals = torch.tensor([lo for lo, _ in param_ranges_flat[op_idx]], dtype=torch.float32)
-                    high_vals = torch.tensor([hi for _, hi in param_ranges_flat[op_idx]], dtype=torch.float32)
+            def sample_uniform_dirs_torch(n):
+                v = torch.randn(n,3)
+                return v / (v.norm(dim=1, keepdim=True)+1e-12)
 
-                    attempts = 0
-                    while (len(pos_list) < target_pos or len(neg_list) < target_neg) and attempts < max_attempts:
-                        attempts += 1
+            def dirs_to_bins_numpy(dirs_np):
+                x,y,z = dirs_np[:,0], dirs_np[:,1], dirs_np[:,2]
+                az = (np.arctan2(y,x)+np.pi)/(2*np.pi)
+                el = (np.arcsin(np.clip(z,-1,1))+np.pi/2)/np.pi
+                az_idx = np.clip(np.floor(az*NUM_AZ).astype(int),0,NUM_AZ-1)
+                el_idx = np.clip(np.floor(el*NUM_EL).astype(int),0,NUM_EL-1)
+                flat = az_idx*NUM_EL + el_idx
+                return flat, az_idx, el_idx
 
-                        # sample xyz
-                        xyz = (torch.rand(batch_size, 3, dtype=torch.float32) * 2 - 1) * self.domainRadius
+            def uniformity_score_from_counts(counts):
+                counts = counts.astype(np.float32)
+                return 1.0 / (1.0 + counts.std()/(counts.mean()+1e-9)) if counts.sum()>0 else 0.0
 
-                        # sample operator parameters
-                        rand_params = torch.rand((batch_size, add_n_params_not_operator), dtype=torch.float32)
-                        sampled_params = low_vals + rand_params * (high_vals - low_vals)
+            def estimate_surface_radius(sdf_fn, center, num_probes=2048):
+                dirs = sample_uniform_dirs_torch(num_probes)
+                probe_pts = center.unsqueeze(0) + dirs * (self.domainRadius*0.95)
+                sdf_vals = sdf_fn(probe_pts, None)
+                if sdf_vals.dim()==2: sdf_vals = sdf_vals[:,0]
+                approx_Rs = ((probe_pts - center.unsqueeze(0)).norm(dim=1) - sdf_vals).cpu().numpy()
+                R = float(np.median(approx_Rs))
+                return R if np.isfinite(R) and R>0 else float(self.domainRadius*0.9)
 
-                        # continuous operator code (column 4)
-                        op_value = torch.full((batch_size, 1), float(i), dtype=torch.float32)
+            any_sdf_fn, _ = next(iter(scene_with_operators.values()))
+            shape_center = estimate_center(any_sdf_fn).float()
+            print(f"[INFO] Estimated center: {shape_center.tolist()}")
 
-                        # assemble query: [x, y, z, op_code, params...]
-                        queries_op = torch.cat([xyz, op_value, sampled_params], dim=1)
+            # -------------------------
+            # Per-operator targets
+            # -------------------------
+            total_target_each_op = max(1, specs["SamplesPerScene"] // max(1,n_ops))
+            target_pos = total_target_each_op // 2
+            target_neg = total_target_each_op - target_pos
 
-                        # evaluate SDF
-                        sdf_fn, _ = scene_with_operators[key]
-                        sdf_op_vals = sdf_fn(xyz, sampled_params)
-                        if sdf_op_vals.dim() == 1:
-                            sdf_op_vals = sdf_op_vals.unsqueeze(1)
+            pos_chunks, neg_chunks = [], []
+            op_stats = {k: {"pos":0,"neg":0,"attempts":0,"pos_uniformity":0.0,"neg_uniformity":0.0,
+                            "pos_bin_counts":[],"neg_bin_counts":[]} for k in operator_keys}
 
-                        data = torch.cat([queries_op, sdf_op_vals], dim=1).numpy()
-                        sdf_col_idx = data.shape[1] - 1
-                        batch_pos = data[np.abs(data[:, sdf_col_idx]) < specs["ClampingDistance"]]
-                        batch_neg = data[np.abs(data[:, sdf_col_idx]) >= specs["ClampingDistance"]]
+            # -------------------------
+            # Per-operator sampling
+            # -------------------------
+            for op_idx, key in enumerate(operator_keys):
+                sdf_fn, _ = scene_with_operators[key]
+                op_has_params = len(param_ranges_flat) > op_idx and len(param_ranges_flat[op_idx])>0
+                if op_has_params:
+                    pr = param_ranges_flat[op_idx]
+                    low_vals = torch.tensor([lo for lo,_ in pr], dtype=torch.float32)
+                    high_vals = torch.tensor([hi for _,hi in pr], dtype=torch.float32)
+                    n_params_for_op = len(pr)
+                else:
+                    low_vals = high_vals = None
+                    n_params_for_op = 0
 
-                        if len(pos_list) < target_pos:
-                            remaining = target_pos - len(pos_list)
-                            pos_list.append(batch_pos[:remaining])
-                        if len(neg_list) < target_neg:
-                            remaining = target_neg - len(neg_list)
-                            neg_list.append(batch_neg[:remaining])
+                surface_radius = estimate_surface_radius(sdf_fn, shape_center)
+                shell_min = max(0.0, surface_radius - cl*1.5)
+                shell_max = surface_radius + cl*1.5
 
-                # ---------------- Combine all batches ----------------
-                pos = np.vstack(pos_list) if pos_list else np.empty((0, batch_size), dtype=np.float32)
-                neg = np.vstack(neg_list) if neg_list else np.empty((0, batch_size), dtype=np.float32)
+                # bin tracking
+                pos_bin_counts = np.zeros(NUM_BINS,dtype=int)
+                neg_bin_counts = np.zeros(NUM_BINS,dtype=int)
+                bin_target_pos = max(1,target_pos//NUM_BINS)
+                bin_target_neg = max(1,target_neg//NUM_BINS)
 
-                ## Determine if all scenes have exactly one operator
-                all_scenes_single_operator = all(len(scene) == 1 for scene in self.scenes.values())
+                op_pos_buf, op_neg_buf = [], []
+                attempts = 0
 
-                # BEFORE saving - ensure we keep the sdf column (last column)
-                if all_scenes_single_operator:
-                    # pos/neg may have several forms:
-                    # - [x,y,z,sdf]                 -> shape[1] == 4  (leave as-is)
-                    # - [x,y,z,op_code,params...,sdf] -> shape[1] >= 5 (drop op_code at index 3)
-                    # - if somehow other shapes appear, print shapes for debugging
-                    if pos.size > 0:
-                        if pos.shape[1] >= 5:
-                            # drop only the op_code (index 3)
-                            pos = np.concatenate([pos[:, :3], pos[:, 4:]], axis=1)
-                        elif pos.shape[1] == 4:
-                            # already [x,y,z,sdf] -> keep as-is
-                            pass
-                        else:
-                            print(f"[WARN] Unexpected pos shape before saving: {pos.shape}")
-                    if neg.size > 0:
-                        if neg.shape[1] >= 5:
-                            neg = np.concatenate([neg[:, :3], neg[:, 4:]], axis=1)
-                        elif neg.shape[1] == 4:
-                            pass
-                        else:
-                            print(f"[WARN] Unexpected neg shape before saving: {neg.shape}")
+                # -------------------------
+                # Deterministic per-bin sampling
+                # -------------------------
+                while (sum(c.shape[0] for c in op_pos_buf) < target_pos or sum(c.shape[0] for c in op_neg_buf) < target_neg) and attempts<max_attempts:
+                    attempts += 1
+                    dirs = sample_uniform_dirs_torch(batch_size)
+                    r = shell_min + torch.rand(batch_size,1)*(shell_max-shell_min)
+                    xyz = shape_center.unsqueeze(0)+dirs*r
 
-                # ---------------- Save ----------------
-                np.savez_compressed(samples_file, pos=pos, neg=neg)
+                    if op_has_params:
+                        rp = torch.rand(batch_size,n_params_for_op)
+                        sampled_params = low_vals + rp*(high_vals-low_vals)
+                    else:
+                        sampled_params = None
+
+                    sdf_vals = sdf_fn(xyz, sampled_params)
+                    if sdf_vals.dim()==1: sdf_vals = sdf_vals.unsqueeze(1)
+                    data = torch.cat([xyz, sdf_vals], dim=1).cpu().numpy()
+                    sdf_v = data[:,-1]
+
+                    mask_near = np.abs(sdf_v)<=cl
+                    if mask_near.sum()==0: continue
+                    near_data = data[mask_near]
+                    near_xyz = near_data[:,:3]
+                    near_sdf = near_data[:,-1]
+                    is_pos = near_sdf>=0
+                    is_neg = ~is_pos
+
+                    rel = near_xyz - shape_center.cpu().numpy()[None,:]
+                    norms = np.linalg.norm(rel,axis=1,keepdims=True)+1e-12
+                    dirs_np = rel/norms
+                    flat_idx, _, _ = dirs_to_bins_numpy(dirs_np)
+
+                    # -------------------------
+                    # Deterministic selection per bin
+                    # -------------------------
+                    pos_selected = []
+                    neg_selected = []
+                    for bin_id in range(NUM_BINS):
+                        bin_pos_idxs = np.where(is_pos & (flat_idx==bin_id))[0]
+                        bin_neg_idxs = np.where(is_neg & (flat_idx==bin_id))[0]
+
+                        n_select_pos = max(0, bin_target_pos - pos_bin_counts[bin_id])
+                        n_select_neg = max(0, bin_target_neg - neg_bin_counts[bin_id])
+
+                        if len(bin_pos_idxs)>0 and n_select_pos>0:
+                            chosen = np.random.choice(bin_pos_idxs, min(n_select_pos,len(bin_pos_idxs)), replace=False)
+                            pos_selected.append(near_data[chosen])
+                            pos_bin_counts[bin_id] += len(chosen)
+
+                        if len(bin_neg_idxs)>0 and n_select_neg>0:
+                            chosen = np.random.choice(bin_neg_idxs, min(n_select_neg,len(bin_neg_idxs)), replace=False)
+                            neg_selected.append(near_data[chosen])
+                            neg_bin_counts[bin_id] += len(chosen)
+
+                    if pos_selected: op_pos_buf.append(np.vstack(pos_selected))
+                    if neg_selected: op_neg_buf.append(np.vstack(neg_selected))
+
+                    op_stats[key]["pos"] = sum(c.shape[0] for c in op_pos_buf)
+                    op_stats[key]["neg"] = sum(c.shape[0] for c in op_neg_buf)
+                    op_stats[key]["attempts"] = attempts
+
+                pos_chunks.append(np.vstack(op_pos_buf) if op_pos_buf else np.empty((0, data.shape[1])))
+                neg_chunks.append(np.vstack(op_neg_buf) if op_neg_buf else np.empty((0, data.shape[1])))
+                op_stats[key]["pos_uniformity"] = uniformity_score_from_counts(pos_bin_counts)
+                op_stats[key]["neg_uniformity"] = uniformity_score_from_counts(neg_bin_counts)
+                op_stats[key]["pos_bin_counts"] = pos_bin_counts.tolist()
+                op_stats[key]["neg_bin_counts"] = neg_bin_counts.tolist()
+
+            # -------------------------
+            # Merge all operators and save
+            # -------------------------
+            pos = np.vstack(pos_chunks) if any(p.size for p in pos_chunks) else np.empty((0,data.shape[1]),dtype=np.float32)
+            neg = np.vstack(neg_chunks) if any(n.size for n in neg_chunks) else np.empty((0,data.shape[1]),dtype=np.float32)
+
+            if all(len(scene)==1 for scene in self.scenes.values()):
+                if pos.shape[1]>3: pos = np.concatenate([pos[:,:3], pos[:,4:]], axis=1)
+                if neg.shape[1]>3: neg = np.concatenate([neg[:,:3], neg[:,4:]], axis=1)
+
+            pos = pos.astype(np.float32)
+            neg = neg.astype(np.float32)
+            min_cols = min(pos.shape[1], neg.shape[1])
+            if pos.shape[1]!=neg.shape[1]:
+                print("[WARN] Pos/Neg column mismatch; trimming to:", min_cols)
+                pos = pos[:,:min_cols]
+                neg = neg[:,:min_cols]
+
+            print(f"[SAVE] Writing samples to: {samples_file}")
+            np.savez_compressed(samples_file,pos=pos,neg=neg)
+
+            print("\n[OPERATOR STATISTICS for scene]")
+            for k in operator_keys:
+                s = op_stats[k]
+                total_seen = s.get("pos",0)+s.get("neg",0)
+                print(f"  {k}: attempts={s.get('attempts',0)}, total_seen={total_seen}, pos={s.get('pos',0)}, neg={s.get('neg',0)}")
+                print(f"    uniformity -> pos={s.get('pos_uniformity',0):.4f}, neg={s.get('neg_uniformity',0):.4f}")
+
+            print("="*62)
+            print(f"[SAMPLE] Completed scene: {instance_key}")
+            print("="*62)
+        # -------------------------
+        # End scene sampling loop
+        # -------------------------
+
 
         # ---------------- Training (Single Pass Over All Scenes) ----------------
         print(f"[INFO] Starting unified DeepSDF training for all {len(self.scenes)} scenes.")
