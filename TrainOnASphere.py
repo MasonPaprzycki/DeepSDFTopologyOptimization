@@ -53,7 +53,7 @@ model = Model(
     scenes=scenes,
     resume=False,
     latentDim=1,
-    NumEpochs=10,
+    NumEpochs=100,
     domainRadius=0.45
 )
 

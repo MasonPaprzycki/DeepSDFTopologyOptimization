@@ -1,0 +1,7 @@
+{
+  "train": {
+    "TrainOnASphereModel": [
+      "trainonaspheremodel_sphere"
+    ]
+  }
+}
